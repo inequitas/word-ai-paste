@@ -105,11 +105,18 @@
       </section>
 
       <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <div id="error-details" class="error-details" hidden>
+        <pre id="error-details-text"></pre>
+        <button id="copy-error-btn" class="btn btn-secondary btn-small" type="button">Copy details</button>
+        <span id="copy-error-feedback" class="copy-feedback" hidden>Copied.</span>
+      </div>
     </main>
 
     <footer class="app-footer">
       <a href="#" id="selftest-link">Run self-test</a>
       <div id="selftest-result" class="selftest-result" hidden></div>
+      <p id="build-version" class="build-version"></p>
     </footer>
   </div>
 

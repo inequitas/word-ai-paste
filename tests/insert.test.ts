@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { insertBlocks, DEFAULT_INSERT_OPTIONS } from '../src/word/insert';
+import { insertBlocks, DEFAULT_INSERT_OPTIONS, InsertError } from '../src/word/insert';
 import type { Block } from '../src/model';
 import { FakeWordDocument, isParagraph, isTable, paragraphText } from './fakeWordAdapter';
 
@@ -376,5 +376,134 @@ describe('WordDocument.verifyAndRepairListItems (fake adapter safety net)', () =
     await doc.verifyAndRepairListItems([{ handle: paragraph, intendedListItem: false }]);
     expect(doc.repairedCount).toBe(0);
     expect(doc.warnings).toHaveLength(0);
+  });
+});
+
+describe('insertBlocks — OOXML fallback when the list API throws', () => {
+  it('falls back to insertOoxmlList (replacing the anchor) when startNewList() throws on the first item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('startNewList');
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'a' }] },
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'b' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+
+    expect(doc.ooxmlCalls).toHaveLength(1);
+    expect(doc.ooxmlCalls[0].anchorIsEmpty).toBe(true);
+    expect(doc.ooxmlCalls[0].items).toHaveLength(2); // the whole run, since nothing had committed yet
+
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras).toHaveLength(2);
+    expect(paras.every((p) => p.viaOoxml)).toBe(true);
+    expect(paras.every((p) => p.styleBuiltIn === 'ListParagraph')).toBe(true);
+    expect(paragraphText(paras[0])).toBe('a');
+    expect(paragraphText(paras[1])).toBe('b');
+  });
+
+  it('falls back only for the remaining items when a later item fails to join the list', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('insertItemAfter'); // fails on item 2, after item 1 already succeeded
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'first' }] },
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'second' }] },
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'third' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+
+    expect(doc.ooxmlCalls).toHaveLength(1);
+    expect(doc.ooxmlCalls[0].anchorIsEmpty).toBe(false); // item 1 already exists; insert after it
+    expect(doc.ooxmlCalls[0].items).toHaveLength(2); // only items 2 and 3
+
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras).toHaveLength(3);
+    expect(paragraphText(paras[0])).toBe('first');
+    expect(paras[0].viaOoxml).toBeUndefined(); // created via the primary API path
+    expect(paragraphText(paras[1])).toBe('second');
+    expect(paras[1].viaOoxml).toBe(true);
+    expect(paragraphText(paras[2])).toBe('third');
+    expect(paras[2].viaOoxml).toBe(true);
+  });
+
+  it('a non-list block right after an ooxml-fallback list is still not a list item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('startNewList');
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'a' }] },
+      { type: 'paragraph', inlines: [{ text: 'after' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    const last = paras[paras.length - 1];
+    expect(paragraphText(last)).toBe('after');
+    expect(last.listRef).toBeUndefined();
+  });
+
+  it('records both the failure and the fallback in the step log without throwing', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('startNewList');
+    const blocks: Block[] = [{ type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'a' }] }];
+    await expect(insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS)).resolves.toBeUndefined();
+  });
+
+  it('still restarts numbering at 1 for an ordered list rebuilt via the ooxml fallback', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('startNewList');
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: true, level: 0, listIndex: 1, inlines: [{ text: 'a' }] },
+      { type: 'listItem', ordered: true, level: 0, listIndex: 1, inlines: [{ text: 'b' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    expect(doc.ooxmlCalls[0].items.every((i) => i.ordered)).toBe(true);
+  });
+});
+
+describe('insertBlocks — diagnostics on total failure', () => {
+  it('throws an InsertError carrying the step log and the failing step when both paths fail', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('startNewList');
+    const originalInsertOoxmlList = doc.insertOoxmlList.bind(doc);
+    doc.insertOoxmlList = async () => {
+      throw new Error('ooxml also failed');
+    };
+    void originalInsertOoxmlList;
+
+    const blocks: Block[] = [{ type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'a' }] }];
+
+    let caught: unknown;
+    try {
+      await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(InsertError);
+    const err = caught as InsertError;
+    expect(err.steps.length).toBeGreaterThan(0);
+    expect(err.steps.some((s) => s.action.includes('ooxml-fallback'))).toBe(true);
+    expect(err.message).toContain('block 0');
+  });
+
+  it('a plain non-list failure reports the block index/type/action that failed', async () => {
+    const doc = new FakeWordDocument({ anchorText: 'existing' });
+    const originalCommit = doc.commit.bind(doc);
+    let calls = 0;
+    doc.commit = async () => {
+      calls++;
+      if (calls === 1) throw new Error('simulated commit failure');
+      return originalCommit();
+    };
+    const blocks: Block[] = [{ type: 'heading', level: 1, inlines: [{ text: 'Title' }] }];
+
+    let caught: unknown;
+    try {
+      await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(InsertError);
+    const err = caught as InsertError;
+    expect(err.failedStep).toMatchObject({ blockIndex: 0, blockType: 'heading', action: 'insertParagraphAfter' });
   });
 });

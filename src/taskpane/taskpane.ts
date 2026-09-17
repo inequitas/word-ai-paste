@@ -3,7 +3,7 @@ import { parseMarkdown } from '../parse/markdown';
 import { parseHtml } from '../parse/html';
 import { detectFormat, formatLabel, type DetectedFormat } from '../parse/detect';
 import { normalize, type NormalizeOptions } from '../transform/normalize';
-import { DEFAULT_TABLE_STYLE, type InsertOptions } from '../word/insert';
+import { DEFAULT_TABLE_STYLE, InsertError, type InsertOptions, type StepLogEntry } from '../word/insert';
 import {
   loadNormalizeOptions,
   saveNormalizeOptions,
@@ -61,9 +61,17 @@ const el = {
   insertBtn: byId('insert-btn') as HTMLButtonElement,
   clearBtn: byId('clear-btn') as HTMLButtonElement,
   status: byId('status'),
+  errorDetails: byId('error-details'),
+  errorDetailsText: byId('error-details-text'),
+  copyErrorBtn: byId('copy-error-btn') as HTMLButtonElement,
+  copyErrorFeedback: byId('copy-error-feedback'),
   selftestLink: byId('selftest-link'),
-  selftestResult: byId('selftest-result')
+  selftestResult: byId('selftest-result'),
+  buildVersion: byId('build-version')
 };
+
+/** The full diagnostic payload behind the current "Copy details" button, if any. */
+let lastCopyPayload: string | null = null;
 
 function byId(id: string): HTMLElement {
   const found = document.getElementById(id);
@@ -78,6 +86,7 @@ function byId(id: string): HTMLElement {
 init();
 
 async function init(): Promise<void> {
+  el.buildVersion.textContent = `AI Paste v${__APP_VERSION__} (${__GIT_HASH__})`;
   hydrateOptionControls();
   wireEvents();
 
@@ -179,6 +188,21 @@ function wireEvents(): void {
   el.insertBtn.addEventListener('click', onInsertClick);
   el.clearBtn.addEventListener('click', onClearClick);
   el.selftestLink.addEventListener('click', onSelfTestClick);
+  el.copyErrorBtn.addEventListener('click', onCopyDetailsClick);
+}
+
+async function onCopyDetailsClick(): Promise<void> {
+  if (!lastCopyPayload) return;
+  try {
+    await navigator.clipboard.writeText(lastCopyPayload);
+    el.copyErrorFeedback.hidden = false;
+    setTimeout(() => {
+      el.copyErrorFeedback.hidden = true;
+    }, 2000);
+  } catch {
+    // Clipboard API can be blocked in some hosts; the pre-formatted text is
+    // still selectable/visible on screen either way.
+  }
 }
 
 function onPaste(e: ClipboardEvent): void {
@@ -228,22 +252,77 @@ function onClearClick(): void {
   el.pasteBox.value = '';
   el.pasteNotice.hidden = true;
   setStatus('', 'idle');
+  hideErrorDetails();
   runPipeline();
 }
 
 async function onInsertClick(): Promise<void> {
   if (!state.blocks.length) return;
   el.insertBtn.disabled = true;
+  hideErrorDetails();
   setStatus('Inserting…', 'idle');
   try {
     const { insertBlocksInWord } = await import('../word/officeAdapter');
     await insertBlocksInWord(state.blocks, buildInsertOptions());
     setStatus(`Inserted ${state.blocks.length} block${state.blocks.length === 1 ? '' : 's'}.`, 'ok');
   } catch (err) {
-    setStatus(`Insert failed: ${errorMessage(err)}`, 'error');
+    if (err instanceof InsertError) {
+      setStatus(`Insert failed: ${err.officeError.message}`, 'error');
+      showErrorDetails(err);
+    } else {
+      setStatus(`Insert failed: ${errorMessage(err)}`, 'error');
+    }
   } finally {
     updateInsertAvailability();
   }
+}
+
+function hideErrorDetails(): void {
+  el.errorDetails.hidden = true;
+  el.errorDetailsText.textContent = '';
+  lastCopyPayload = null;
+}
+
+function showErrorDetails(err: InsertError): void {
+  const step = err.failedStep;
+  const lines = [
+    step ? `Failed step: block ${step.blockIndex} (${step.blockType}): ${step.action}` : 'Failed during setup',
+    `code: ${err.officeError.code ?? '(none)'}`,
+    `message: ${err.officeError.message}`,
+    `errorLocation: ${err.officeError.errorLocation ?? '(none)'}`,
+    `statement: ${err.officeError.statement ?? '(none)'}`
+  ];
+  el.errorDetailsText.textContent = lines.join('\n');
+  el.errorDetails.hidden = false;
+  el.copyErrorFeedback.hidden = true;
+  lastCopyPayload = formatStepLogForCopy(err.officeError, step, err.steps);
+}
+
+function formatStepLogForCopy(
+  officeError: { code?: string; message: string; errorLocation?: string; statement?: string },
+  failedStep: StepLogEntry | null,
+  steps: StepLogEntry[]
+): string {
+  const payload = {
+    version: `${__APP_VERSION__} (${__GIT_HASH__})`,
+    when: new Date().toISOString(),
+    officeError,
+    failedStep,
+    steps: steps.map((s) => `block ${s.blockIndex} ${s.blockType}: ${s.action}`)
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+interface SelfTestCheckLike {
+  label: string;
+  pass: boolean;
+  detail?: string;
+}
+interface SelfTestResultLike {
+  ranAt: string;
+  allPassed: boolean;
+  probes?: SelfTestCheckLike[];
+  checks: SelfTestCheckLike[];
 }
 
 async function onSelfTestClick(e: Event): Promise<void> {
@@ -272,17 +351,45 @@ async function onSelfTestClick(e: Event): Promise<void> {
   }
 }
 
-function renderSelfTestResult(result: { ranAt: string; allPassed: boolean; checks: { label: string; pass: boolean; detail?: string }[] }): void {
+function renderSelfTestResult(result: SelfTestResultLike): void {
   el.selftestResult.hidden = false;
-  const items = result.checks
-    .map(
-      (c) =>
-        `<li class="${c.pass ? 'selftest-pass' : 'selftest-fail'}">${c.pass ? '✓' : '✗'} ${escapeHtml(c.label)}${
-          c.detail ? ` — <span class="muted">${escapeHtml(c.detail)}</span>` : ''
-        }</li>`
-    )
-    .join('');
-  el.selftestResult.innerHTML = `<strong>${result.allPassed ? 'All checks passed' : 'Some checks failed'}</strong><ul>${items}</ul>`;
+
+  const list = (checks: SelfTestCheckLike[]): string =>
+    `<ul>${checks
+      .map(
+        (c) =>
+          `<li class="${c.pass ? 'selftest-pass' : 'selftest-fail'}">${c.pass ? '✓' : '✗'} ${escapeHtml(c.label)}${
+            c.detail ? ` — <span class="muted">${escapeHtml(c.detail)}</span>` : ''
+          }</li>`
+      )
+      .join('')}</ul>`;
+
+  const probesHtml = result.probes?.length ? `<strong>Capability probes</strong>${list(result.probes)}` : '';
+  const checksHtml = `<strong>Fixture</strong>${list(result.checks)}`;
+
+  el.selftestResult.innerHTML =
+    `<strong>${result.allPassed ? 'All checks passed' : 'Some checks failed'}</strong>` +
+    probesHtml +
+    checksHtml +
+    `<button id="selftest-copy-btn" class="btn btn-secondary btn-small" type="button">Copy results</button>` +
+    `<span id="selftest-copy-feedback" class="copy-feedback" hidden>Copied.</span>`;
+
+  const copyBtn = document.getElementById('selftest-copy-btn') as HTMLButtonElement | null;
+  const feedback = document.getElementById('selftest-copy-feedback');
+  copyBtn?.addEventListener('click', async () => {
+    const payload = JSON.stringify({ version: `${__APP_VERSION__} (${__GIT_HASH__})`, ...result }, null, 2);
+    try {
+      await navigator.clipboard.writeText(payload);
+      if (feedback) {
+        feedback.hidden = false;
+        setTimeout(() => {
+          feedback.hidden = true;
+        }, 2000);
+      }
+    } catch {
+      /* clipboard API can be blocked; the checklist is still visible on screen */
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

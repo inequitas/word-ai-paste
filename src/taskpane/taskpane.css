@@ -235,6 +235,38 @@ details.options summary {
   color: var(--danger);
 }
 
+.error-details {
+  margin-top: 6px;
+  border: 1px solid #f3c6c0;
+  border-radius: 4px;
+  background: var(--danger-bg);
+  padding: 8px;
+}
+
+.error-details pre {
+  margin: 0 0 6px;
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--danger);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.btn-small {
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.copy-feedback {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--ok);
+}
+
 .banner {
   border-radius: 4px;
   padding: 8px 10px;
@@ -258,6 +290,12 @@ details.options summary {
 .app-footer a {
   color: var(--text-muted);
   text-decoration: underline;
+}
+
+.build-version {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
 }
 
 .selftest-result {
