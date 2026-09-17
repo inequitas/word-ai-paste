@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Paste</title>
+  <link rel="stylesheet" href="/src/taskpane/taskpane.css" />
+  <!-- Office.js must load before our app code. -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="app-header">
+      <h1>AI Paste</h1>
+      <p class="tagline">Paste GPT text with your document's own styles.</p>
+    </header>
+
+    <div id="host-banner" class="banner banner-warning" hidden></div>
+
+    <main>
+      <section class="section">
+        <label class="field-label" for="paste-box">1. Paste your text</label>
+        <textarea
+          id="paste-box"
+          placeholder="Paste here (Cmd+V) — Markdown or formatted text from a chat window"
+          rows="7"
+        ></textarea>
+        <p id="paste-notice" class="notice" hidden></p>
+      </section>
+
+      <section class="section detect-row">
+        <span class="field-label">Detected:</span>
+        <span id="detected-format" class="pill">—</span>
+        <div class="segmented" id="format-override" role="group" aria-label="Override detected format">
+          <button type="button" class="segmented-btn" data-format="markdown">Markdown</button>
+          <button type="button" class="segmented-btn" data-format="html">Formatted text</button>
+        </div>
+      </section>
+
+      <section class="section">
+        <div id="preview" class="preview">
+          <p class="muted">Nothing pasted yet.</p>
+        </div>
+      </section>
+
+      <details class="section options">
+        <summary>Options</summary>
+
+        <div class="option-row">
+          <label for="opt-top-heading">Top heading level</label>
+          <select id="opt-top-heading">
+            <option value="1">Heading 1</option>
+            <option value="2">Heading 2</option>
+            <option value="3">Heading 3</option>
+            <option value="4">Heading 4</option>
+          </select>
+        </div>
+
+        <label class="option-checkbox">
+          <input type="checkbox" id="opt-bold-heading" />
+          Bold-only lines → headings
+        </label>
+
+        <label class="option-checkbox">
+          <input type="checkbox" id="opt-citations" />
+          Remove citation markers
+        </label>
+
+        <label class="option-checkbox">
+          <input type="checkbox" id="opt-manual-numbers" />
+          Remove manual heading numbers (1., 2.3, …)
+        </label>
+
+        <label class="option-checkbox">
+          <input type="checkbox" id="opt-emoji" />
+          Remove emoji
+        </label>
+
+        <label class="option-checkbox">
+          <input type="checkbox" id="opt-blank-lines" />
+          Blank lines between blocks (house style)
+        </label>
+
+        <div class="option-row">
+          <label for="opt-body-style">Body style</label>
+          <select id="opt-body-style">
+            <option value="builtin:Normal">Normal (default)</option>
+          </select>
+        </div>
+
+        <div class="option-row">
+          <label for="opt-table-style">Table style</label>
+          <select id="opt-table-style">
+            <option value="builtin:GridTable4">Grid Table 4 (default)</option>
+            <option value="builtin:GridTable1Light">Grid Table 1 Light</option>
+            <option value="builtin:PlainTable1">Plain Table 1</option>
+          </select>
+        </div>
+      </details>
+
+      <section class="section actions">
+        <button id="insert-btn" class="btn btn-primary" type="button">Insert at cursor</button>
+        <button id="clear-btn" class="btn btn-secondary" type="button">Clear</button>
+      </section>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </main>
+
+    <footer class="app-footer">
+      <a href="#" id="selftest-link">Run self-test</a>
+      <div id="selftest-result" class="selftest-result" hidden></div>
+    </footer>
+  </div>
+
+  <script type="module" src="/src/taskpane/taskpane.ts"></script>
+</body>
+</html>

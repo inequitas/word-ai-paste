@@ -1,0 +1,282 @@
+:root {
+  --accent: #185abd;
+  --accent-hover: #124a9c;
+  --text: #242424;
+  --text-muted: #616161;
+  --border: #d1d1d1;
+  --bg: #ffffff;
+  --bg-subtle: #f5f5f5;
+  --danger: #b0281a;
+  --danger-bg: #fdf0ee;
+  --ok: #0f7b3f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+}
+
+.app {
+  min-width: 280px;
+  max-width: 480px;
+  margin: 0 auto;
+  padding: 12px 14px 20px;
+}
+
+.app-header h1 {
+  font-size: 18px;
+  margin: 0 0 2px;
+}
+
+.tagline {
+  margin: 0 0 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.section {
+  margin-bottom: 14px;
+}
+
+.field-label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+textarea#paste-box {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+}
+
+textarea#paste-box:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.notice {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+
+.detect-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-left: auto;
+}
+
+.segmented-btn {
+  border: none;
+  background: var(--bg);
+  color: var(--text);
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.segmented-btn + .segmented-btn {
+  border-left: 1px solid var(--border);
+}
+
+.segmented-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.preview {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  min-height: 48px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12px;
+  background: var(--bg-subtle);
+}
+
+.preview .muted {
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.preview-outline {
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+
+.preview-outline li {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 0;
+}
+
+.preview-counts {
+  margin: 0;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+details.options summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.option-row select {
+  flex: 1 1 auto;
+  max-width: 62%;
+  padding: 3px 4px;
+}
+
+.option-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0;
+  cursor: pointer;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  border-radius: 4px;
+  border: 1px solid transparent;
+  padding: 9px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  flex: 1 1 auto;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  background: #b9c9e4;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.status {
+  min-height: 16px;
+  font-size: 12px;
+  margin: 8px 0 0;
+}
+
+.status.status-ok {
+  color: var(--ok);
+}
+
+.status.status-error {
+  color: var(--danger);
+}
+
+.banner {
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.banner-warning {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid #f3c6c0;
+}
+
+.app-footer {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  font-size: 11px;
+}
+
+.app-footer a {
+  color: var(--text-muted);
+  text-decoration: underline;
+}
+
+.selftest-result {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  background: var(--bg-subtle);
+}
+
+.selftest-result ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.selftest-pass {
+  color: var(--ok);
+}
+
+.selftest-fail {
+  color: var(--danger);
+}
