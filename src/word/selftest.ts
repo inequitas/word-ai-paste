@@ -1,354 +1,465 @@
 /// <reference types="office-js" />
-import { parseMarkdown } from '../parse/markdown';
-import { normalize, DEFAULT_NORMALIZE_OPTIONS } from '../transform/normalize';
-import { insertBlocks, DEFAULT_INSERT_OPTIONS, InsertError, extractOfficeErrorInfo } from './insert';
+import { DEFAULT_INSERT_OPTIONS, InsertError, describeError, formatStep, insertBlocks } from './insert';
 import { OfficeWordDocument, isWordApi13Supported } from './officeAdapter';
 import { buildListOoxml } from './ooxml';
+import { buildFixtureBlocks, buildFixtureChecks, ooxmlBodyFacts, type SelfTestCheck } from './selftestFixture';
+import { listLevelIndents, round } from './verify';
 
-/**
- * Fixture exercised by the self-test: real H1-H3 headings, a bold pseudo
- * heading, mixed inline formatting, a citation marker, nested bullets, two
- * separate numbered lists (each must restart at 1), a table, and a quote —
- * one markdown string run through the exact same parse -> normalize ->
- * insert pipeline as a real paste.
- *
- * "Blank lines between blocks" is deliberately turned OFF for this fixture
- * (unlike the real default) so that a body paragraph and a heading sit
- * *directly* after a list with nothing normalize.ts would insert in
- * between — that adjacency is exactly what real Word can silently turn
- * into "just another list item" (see insert.ts's "Leaving a list cleanly"
- * doc comment), and unit tests can't catch that without a real Word
- * runtime. The blank-line spacing feature itself is already covered by
- * tests/normalize.test.ts. A genuine empty paragraph is then spliced in
- * by hand right after the third list, below, since Markdown itself has no
- * way to express an empty paragraph.
- */
-const FIXTURE_MARKDOWN = `# Self-test heading 1
-
-## Self-test heading 2
-
-### Self-test heading 3
-
-**Pseudo heading via bold line**
-
-A paragraph with **bold**, *italic* and a [link](https://example.com) run, plus a citation marker【1†source】.
-
-- Bullet one
-  - Nested bullet
-- Bullet two
-
-Body text right after the bulleted list.
-
-1. First numbered list, item one
-2. First numbered list, item two
-
-## A heading right after a numbered list
-
-1. Second numbered list, item one
-2. Second numbered list, item two
-
-| Column A | Column B |
-| --- | --- |
-| a1 | b1 |
-| a2 | b2 |
-
-> A quoted line for the self-test.
-`;
-
-export interface SelfTestCheck {
-  label: string;
-  pass: boolean;
-  detail?: string;
-}
+export type { SelfTestCheck } from './selftestFixture';
 
 export interface SelfTestResult {
   ranAt: string;
   allPassed: boolean;
-  /** Small isolated probes of individual risky Office.js calls, run first — see runCapabilityProbes. */
+  /** Small isolated probes of individual Office.js calls, run first — see runCapabilityProbes. */
   probes: SelfTestCheck[];
-  /** Checks against the full markdown -> normalize -> insert pipeline fixture. */
+  /** Checks on the full markdown -> normalize -> two-phase insert fixture. */
   checks: SelfTestCheck[];
+  /** The fixture insert's step log. */
+  steps: string[];
+  /** The fixture insert's read-back mismatches. */
+  mismatches: string[];
+  /** The step that was in progress when something threw, if anything did. */
+  failedStep: string | null;
+}
+
+/** Counts toward "all passed": everything except informational probes that did not throw. */
+function counts(c: SelfTestCheck): boolean {
+  return !c.info || !c.pass;
 }
 
 export async function runSelfTest(): Promise<SelfTestResult> {
-  if (!isWordApi13Supported()) {
-    return {
-      ranAt: new Date().toISOString(),
-      allPassed: false,
-      probes: [],
-      checks: [{ label: 'WordApi 1.3 available', pass: false, detail: 'This Word host is too old for AI Paste.' }]
-    };
-  }
-
-  let blocks = normalize(parseMarkdown(FIXTURE_MARKDOWN), { ...DEFAULT_NORMALIZE_OPTIONS, blankLinesBetweenBlocks: false });
-  // Splice a genuine empty paragraph in right after the third list (before
-  // the table) — Markdown can't express one, but this is exactly the shape
-  // of the "reused an empty bullet as the insertion point" / "blank line
-  // right after a list" case the list-escape logic has to get right.
-  const tableIndex = blocks.findIndex((b) => b.type === 'table');
-  if (tableIndex !== -1) {
-    blocks = [...blocks.slice(0, tableIndex), { type: 'paragraph', inlines: [] }, ...blocks.slice(tableIndex)];
-  }
-
-  const checks: SelfTestCheck[] = [];
-  let probes: SelfTestCheck[] = [];
-
-  await Word.run(async (context) => {
-    probes = await runCapabilityProbes(context);
-
-    const startRange = context.document.getSelection().getRange(Word.RangeLocation.start);
-    startRange.track();
-    await context.sync();
-
-    let insertFailed: InsertError | null = null;
-    try {
-      const doc = new OfficeWordDocument(context);
-      await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
-    } catch (err) {
-      insertFailed = err instanceof InsertError ? err : null;
-      if (!insertFailed) throw err; // truly unexpected — surface it
-    }
-
-    if (insertFailed) {
-      const step = insertFailed.failedStep;
-      checks.push({
-        label: 'Fixture insert completed',
-        pass: false,
-        detail:
-          (step ? `failed at block ${step.blockIndex} (${step.blockType}): ${step.action} — ` : '') +
-          `${insertFailed.officeError.code ?? ''} ${insertFailed.officeError.message}` +
-          (insertFailed.officeError.errorLocation ? ` @ ${insertFailed.officeError.errorLocation}` : '')
-      });
-      startRange.untrack();
-      return; // skip read-back checks — there's nothing reliable to read
-    }
-
-    const endRange = context.document.getSelection().getRange(Word.RangeLocation.start);
-    const spanned = startRange.expandTo(endRange);
-    const paragraphs = spanned.paragraphs;
-    const tables = spanned.tables;
-    paragraphs.load('items/text,items/styleBuiltIn,items/listItemOrNullObject/level,items/listItemOrNullObject/listString');
-    tables.load('items/headerRowCount,items/rowCount');
-    await context.sync();
-
-    const texts = paragraphs.items.map((p) => p.text);
-    const styles = paragraphs.items.map((p) => p.styleBuiltIn as string);
-    const joinedText = texts.join('\n');
-
-    checks.push({
-      label: 'Heading 1, 2 and 3 use styleBuiltIn Heading1/Heading2/Heading3',
-      pass: styles.includes('Heading1') && styles.includes('Heading2') && styles.includes('Heading3')
-    });
-
-    checks.push({
-      label: 'Bold-only line was promoted to a heading',
-      pass: paragraphs.items.some((p) => /pseudo heading/i.test(p.text) && /^Heading\d$/.test(p.styleBuiltIn as string))
-    });
-
-    checks.push({
-      label: 'List paragraphs use the List Paragraph style (styleBuiltIn "ListParagraph")',
-      pass: styles.includes('ListParagraph')
-    });
-
-    let nestedLevelSeen = false;
-    const topLevelNumberedStarts: string[] = [];
-    for (const p of paragraphs.items) {
-      if (p.styleBuiltIn !== 'ListParagraph') continue;
-      const item = p.listItemOrNullObject;
-      if (item.isNullObject) continue;
-      if (item.level > 0) nestedLevelSeen = true;
-      if (item.level === 0 && /^\d+\.$/.test(item.listString.trim())) {
-        topLevelNumberedStarts.push(item.listString.trim());
-      }
-    }
-    checks.push({ label: 'A nested bullet level was created', pass: nestedLevelSeen });
-    checks.push({
-      label: 'Both separate numbered lists restart at "1."',
-      pass: topLevelNumberedStarts.filter((s) => s === '1.').length >= 2,
-      detail: topLevelNumberedStarts.join(', ') || '(none found)'
-    });
-
-    checks.push({
-      label: 'A table with a header row was inserted',
-      pass: tables.items.length > 0 && tables.items.some((t) => t.headerRowCount === 1 && t.rowCount >= 3)
-    });
-
-    checks.push({
-      label: 'A Quote-styled paragraph was inserted',
-      pass: styles.includes('Quote')
-    });
-
-    // The list-escape fix: none of these may come back as ListParagraph.
-    const bodyAfterList = paragraphs.items.find((p) => /body text right after the bulleted list/i.test(p.text));
-    checks.push({
-      label: 'Body text right after a bulleted list is not a list item',
-      pass: !!bodyAfterList && bodyAfterList.styleBuiltIn === 'Normal',
-      detail: bodyAfterList ? `styleBuiltIn: ${bodyAfterList.styleBuiltIn}` : '(paragraph not found)'
-    });
-
-    const headingAfterList = paragraphs.items.find((p) => /heading right after a numbered list/i.test(p.text));
-    checks.push({
-      label: 'A heading right after a list is not a list item',
-      pass: !!headingAfterList && /^Heading\d$/.test(headingAfterList.styleBuiltIn as string),
-      detail: headingAfterList ? `styleBuiltIn: ${headingAfterList.styleBuiltIn}` : '(paragraph not found)'
-    });
-
-    const blankParagraphs = paragraphs.items.filter((p) => p.text.trim() === '');
-    checks.push({
-      label: 'A blank paragraph right after a list is not a list item',
-      pass: blankParagraphs.length > 0 && blankParagraphs.every((p) => p.styleBuiltIn !== 'ListParagraph'),
-      detail: blankParagraphs.length ? `${blankParagraphs.length} blank paragraph(s) found` : '(no blank paragraph found)'
-    });
-
-    checks.push({
-      label: 'No leftover **, heading #, or 【…】 characters in the inserted text',
-      pass: !joinedText.includes('**') && !/(^|\n)\s*#{1,6}\s/.test(joinedText) && !joinedText.includes('【')
-    });
-
-    startRange.untrack();
-  });
-
-  return {
+  const result: SelfTestResult = {
     ranAt: new Date().toISOString(),
-    allPassed: probes.every((p) => p.pass) && checks.every((c) => c.pass),
-    probes,
-    checks
+    allPassed: false,
+    probes: [],
+    checks: [],
+    steps: [],
+    mismatches: [],
+    failedStep: null
+  };
+
+  if (!isWordApi13Supported()) {
+    result.checks.push({ label: 'WordApi 1.3 available', pass: false, detail: 'This Word host is too old for AI Paste.' });
+    return result;
+  }
+
+  const blocks = buildFixtureBlocks();
+  let stage = 'starting Word.run';
+
+  try {
+    await Word.run(async (context) => {
+      stage = 'capability probes';
+      result.probes = await runCapabilityProbes(context, (label) => {
+        stage = `probe "${label}"`;
+      });
+
+      stage = 'fixture insert';
+      let report;
+      try {
+        report = await insertBlocks(new OfficeWordDocument(context), blocks, DEFAULT_INSERT_OPTIONS);
+      } catch (err) {
+        if (!(err instanceof InsertError)) throw err;
+        result.steps = err.steps.map(formatStep);
+        result.failedStep = err.failedStep ? formatStep(err.failedStep) : 'setup';
+        result.checks.push({
+          label: 'fixture insert completed',
+          pass: false,
+          detail: `failed at ${result.failedStep}: ${describeError(err.rawError)}`
+        });
+        return;
+      }
+
+      result.steps = report.steps.map(formatStep);
+      result.mismatches = report.mismatches;
+      const listSummary = report.runs
+        .map((r) => `list ${r.run}: ${r.mode === 'list' ? 'one list' : `per-item from item ${(r.fallbackFrom ?? 0) + 1}`}`)
+        .join(', ');
+      result.checks.push({
+        label: 'fixture insert completed',
+        pass: true,
+        detail: `${blocks.length} blocks, ${report.expected.length} paragraphs; ${listSummary || 'no lists'}${
+          report.repaired ? `; repair pass detached ${report.repaired}` : ''
+        }`
+      });
+
+      stage = 'fixture checks';
+      result.checks.push(...buildFixtureChecks(report));
+    });
+  } catch (err) {
+    result.failedStep = result.failedStep ?? stage;
+    result.checks.push({ label: 'self-test ran to the end', pass: false, detail: `threw during ${stage}: ${describeError(err)}` });
+  }
+
+  result.allPassed = result.checks.length > 0 && [...result.probes, ...result.checks].filter(counts).every((c) => c.pass);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Capability probes — small, isolated checks of individual Office.js calls,
+// run at the end of the document. Each probe is its own try + sync (so a
+// GeneralException is attributed to exactly one call, with debugInfo),
+// reports the values it actually read back, and deletes what it created.
+// ---------------------------------------------------------------------------
+
+interface ProbeScope {
+  /** A new Normal paragraph at the end of the document that is NOT a list item (inherited membership is detached and noted). */
+  plainParagraph(text: string): Promise<Word.Paragraph>;
+  /** Registers something to delete after the probe. */
+  created(obj: { delete(): void }): void;
+}
+
+interface ProbeOutcome {
+  pass: boolean;
+  detail: string;
+}
+
+interface ParaFacts {
+  isListItem: boolean;
+  styleBuiltIn: string;
+  leftIndent: number;
+  firstLineIndent: number;
+  listId: number | null;
+  level: number | null;
+  listString: string | null;
+}
+
+async function readFacts(context: Word.RequestContext, p: Word.Paragraph): Promise<ParaFacts> {
+  p.load('isListItem,styleBuiltIn,leftIndent,firstLineIndent');
+  await context.sync();
+  let listId: number | null = null;
+  let level: number | null = null;
+  let listString: string | null = null;
+  if (p.isListItem) {
+    const list = p.listOrNullObject;
+    const item = p.listItemOrNullObject;
+    list.load('id');
+    item.load('level,listString');
+    await context.sync();
+    listId = list.isNullObject ? null : list.id;
+    level = item.isNullObject ? null : item.level;
+    listString = item.isNullObject ? null : item.listString;
+  }
+  return {
+    isListItem: p.isListItem,
+    styleBuiltIn: String(p.styleBuiltIn),
+    leftIndent: p.leftIndent,
+    firstLineIndent: p.firstLineIndent,
+    listId,
+    level,
+    listString
   };
 }
 
-// ---------------------------------------------------------------------------
-// Capability probes — small, isolated checks of individual risky Office.js
-// calls, run at the end of the document and cleaned up afterward, so a
-// probe failure never blocks another probe or the main fixture. Each is
-// its own try + sync so a GeneralException is attributed precisely, with
-// debugInfo captured the same way InsertError does.
-// ---------------------------------------------------------------------------
-
-async function runProbe(context: Word.RequestContext, label: string, run: () => void | Promise<void>): Promise<SelfTestCheck> {
-  try {
-    await run();
-    await context.sync();
-    return { label, pass: true };
-  } catch (err) {
-    const info = extractOfficeErrorInfo(err);
-    return {
-      label,
-      pass: false,
-      detail: `${info.code ?? ''} ${info.message}${info.errorLocation ? ` @ ${info.errorLocation}` : ''}`.trim()
-    };
-  }
+function describeFacts(f: ParaFacts): string {
+  const parts = [`isListItem=${f.isListItem}`, `style=${f.styleBuiltIn}`];
+  if (f.isListItem) parts.push(`listId=${f.listId ?? '?'}`, `level=${f.level ?? '?'}`, `listString=${JSON.stringify(f.listString)}`);
+  parts.push(indentFacts(f));
+  return parts.join(', ');
 }
 
-async function runCapabilityProbes(context: Word.RequestContext): Promise<SelfTestCheck[]> {
-  const checks: SelfTestCheck[] = [];
-  const body = context.document.body;
+function indentFacts(f: ParaFacts): string {
+  return `leftIndent=${round(f.leftIndent)}, firstLineIndent=${round(f.firstLineIndent)} (text at ${round(f.leftIndent)}pt, bullet/first line at ${round(
+    f.leftIndent + f.firstLineIndent
+  )}pt)`;
+}
 
-  const startRange = body.getRange(Word.RangeLocation.end);
-  startRange.track();
-  await context.sync();
-
-  checks.push(
-    await runProbe(context, 'Insert paragraph with text + styleBuiltIn Heading2', () => {
-      const p = body.insertParagraph('Probe: heading', Word.InsertLocation.end);
-      p.styleBuiltIn = 'Heading2' as Word.BuiltInStyleName;
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'styleBuiltIn = ListParagraph on a paragraph with text', () => {
-      const p = body.insertParagraph('Probe: list paragraph style', Word.InsertLocation.end);
-      p.styleBuiltIn = 'ListParagraph' as Word.BuiltInStyleName;
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'startNewList() on a paragraph WITH text', () => {
-      const p = body.insertParagraph('Probe: list start with text', Word.InsertLocation.end);
-      p.startNewList();
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'startNewList() on an EMPTY paragraph', () => {
-      const p = body.insertParagraph('', Word.InsertLocation.end);
-      p.startNewList();
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'list.setLevelBullet(0, solid)', () => {
-      const p = body.insertParagraph('Probe: bullet level', Word.InsertLocation.end);
-      const list = p.startNewList();
-      list.setLevelBullet(0, Word.ListBullet.solid);
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'list.setLevelNumbering(0, arabic, [0, "."])', () => {
-      const p = body.insertParagraph('Probe: number level', Word.InsertLocation.end);
-      const list = p.startNewList();
-      list.setLevelNumbering(0, Word.ListNumbering.arabic, [0, '.']);
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'list.insertParagraph("x","End") then listItem.level = 1 after its own sync', async () => {
-      const p = body.insertParagraph('Probe: nested list item one', Word.InsertLocation.end);
-      const list = p.startNewList();
-      const second = list.insertParagraph('x', Word.InsertLocation.end);
+async function runProbe(
+  context: Word.RequestContext,
+  label: string,
+  options: { info?: boolean },
+  body: (scope: ProbeScope) => Promise<ProbeOutcome>
+): Promise<SelfTestCheck> {
+  const created: { delete(): void }[] = [];
+  const notes: string[] = [];
+  const scope: ProbeScope = {
+    created: (obj) => created.push(obj),
+    plainParagraph: async (text) => {
+      const p = context.document.body.insertParagraph(text, Word.InsertLocation.end);
+      created.push(p);
+      p.styleBuiltIn = Word.BuiltInStyleName.normal;
+      p.load('isListItem');
       await context.sync();
-      second.listItem.level = 1;
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'insertOoxml bullet list -> isListItem true?', async () => {
-      const p = body.insertParagraph('', Word.InsertLocation.end);
-      const xml = buildListOoxml([{ level: 0, ordered: false, inlines: [{ text: 'Probe: ooxml item' }] }]);
-      const range = p.insertOoxml(xml, Word.InsertLocation.replace);
-      const paragraphs = range.paragraphs;
-      paragraphs.load('items/isListItem');
-      await context.sync();
-      if (!paragraphs.items.length || !paragraphs.items[0].isListItem) {
-        throw new Error('inserted paragraph is not a list item');
+      if (p.isListItem) {
+        p.detachFromList();
+        await context.sync();
+        notes.push('the new paragraph at the end of the document inherited list membership (detached first)');
       }
-    })
-  );
+      return p;
+    }
+  };
 
-  checks.push(
-    await runProbe(context, 'insertTable 2x2 + styleBuiltIn GridTable4 + headerRowCount 1', () => {
-      const p = body.insertParagraph('', Word.InsertLocation.end);
-      const table = p.insertTable(2, 2, Word.InsertLocation.after, [
-        ['A', 'B'],
-        ['1', '2']
-      ]);
-      table.styleBuiltIn = 'GridTable4' as Word.BuiltInStyleName;
-      table.headerRowCount = 1;
-    })
-  );
-
-  checks.push(
-    await runProbe(context, 'selection.isEmpty load; selection.delete() on an empty selection', async () => {
-      const selection = context.document.getSelection();
-      selection.load('isEmpty');
-      await context.sync();
-      if (selection.isEmpty) {
-        selection.delete();
-      }
-    })
-  );
-
-  // Best-effort cleanup: remove everything the probes added, so the
-  // document is left the way it was found.
+  let check: SelfTestCheck;
   try {
-    const endRange = body.getRange(Word.RangeLocation.end);
-    const spanned = startRange.expandTo(endRange);
-    spanned.delete();
+    const outcome = await body(scope);
     await context.sync();
+    check = { label, pass: outcome.pass, detail: [outcome.detail, ...notes].join('; '), info: options.info };
   } catch (err) {
-    console.warn('AI Paste: could not clean up self-test probe content.', err);
+    check = { label, pass: false, detail: [`threw: ${describeError(err)}`, ...notes].join('; '), info: options.info };
   }
-  startRange.untrack();
+
+  // Delete what this probe created, newest first, one sync each so one
+  // failure (e.g. an object that was never created) doesn't block the rest.
+  let cleanupFailures = 0;
+  for (const obj of created.reverse()) {
+    try {
+      obj.delete();
+      await context.sync();
+    } catch {
+      cleanupFailures++;
+    }
+  }
+  if (cleanupFailures) check.detail = `${check.detail}; cleanup: ${cleanupFailures} object(s) could not be deleted`;
+  return check;
+}
+
+async function paragraphCount(context: Word.RequestContext): Promise<number> {
+  const paragraphs = context.document.body.paragraphs;
+  paragraphs.load('items/text');
+  await context.sync();
+  return paragraphs.items.length;
+}
+
+async function runCapabilityProbes(context: Word.RequestContext, onProbe: (label: string) => void): Promise<SelfTestCheck[]> {
+  const checks: SelfTestCheck[] = [];
+  const probe = async (label: string, options: { info?: boolean }, body: (s: ProbeScope) => Promise<ProbeOutcome>): Promise<void> => {
+    onProbe(label);
+    checks.push(await runProbe(context, label, options, body));
+  };
+
+  let countBefore: number | null = null;
+  try {
+    countBefore = await paragraphCount(context);
+  } catch {
+    countBefore = null;
+  }
+
+  await probe('insert paragraph + styleBuiltIn Heading2', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: heading');
+    p.styleBuiltIn = Word.BuiltInStyleName.heading2;
+    p.load('styleBuiltIn');
+    await context.sync();
+    return { pass: p.styleBuiltIn === 'Heading2', detail: `styleBuiltIn=${p.styleBuiltIn}` };
+  });
+
+  await probe('styleBuiltIn ListParagraph on a plain paragraph (no list)', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: list paragraph style');
+    p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: f.styleBuiltIn === 'ListParagraph' && !f.isListItem, detail: describeFacts(f) };
+  });
+
+  await probe('startNewList() on a paragraph with text', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: list start with text');
+    p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    p.startNewList();
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: f.isListItem, detail: `${describeFacts(f)} (Word's default list indent)` };
+  });
+
+  await probe('startNewList() on an empty paragraph', {}, async (s) => {
+    const p = await s.plainParagraph('');
+    p.startNewList();
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: f.isListItem, detail: describeFacts(f) };
+  });
+
+  await probe('list.setLevelBullet(0, solid)', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: bullet level');
+    const list = p.startNewList();
+    await context.sync();
+    list.setLevelBullet(0, Word.ListBullet.solid);
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: f.isListItem, detail: `listString=${JSON.stringify(f.listString)}` };
+  });
+
+  await probe('list.setLevelNumbering(0, arabic, [0, "."]) shows "1."', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: number level');
+    const list = p.startNewList();
+    await context.sync();
+    list.setLevelNumbering(0, Word.ListNumbering.arabic, [0, '.']);
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: (f.listString ?? '').trim() === '1.', detail: `listString=${JSON.stringify(f.listString)}` };
+  });
+
+  await probe('listItem.insertParagraph("x", "After"): does the new paragraph inherit list membership?', { info: true }, async (s) => {
+    const p = await s.plainParagraph('Probe: list item before');
+    const list = p.startNewList();
+    list.load('id');
+    await context.sync();
+    const x = p.insertParagraph('Probe: inserted after a list item', Word.InsertLocation.after);
+    s.created(x);
+    await context.sync();
+    const f = await readFacts(context, x);
+    return {
+      pass: true,
+      detail: `isListItem=${f.isListItem}${f.isListItem ? `, same list as the item before: ${f.listId === list.id}` : ''}, style=${f.styleBuiltIn}`
+    };
+  });
+
+  await probe('attachToList(list.id, 0) on a plain paragraph with text → list item of that list', {}, async (s) => {
+    const owner = await s.plainParagraph('Probe: list owner');
+    owner.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    const list = owner.startNewList();
+    list.load('id');
+    await context.sync();
+    const p = await s.plainParagraph('Probe: attach at level 0');
+    p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    p.attachToList(list.id, 0);
+    await context.sync();
+    const f = await readFacts(context, p);
+    return {
+      pass: f.isListItem && f.listId === list.id,
+      detail: `list.id=${list.id}; ${describeFacts(f)}`
+    };
+  });
+
+  await probe('attachToList(list.id, 1) → listItem.level == 1', {}, async (s) => {
+    const owner = await s.plainParagraph('Probe: list owner');
+    owner.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    const list = owner.startNewList();
+    list.load('id');
+    await context.sync();
+    const p = await s.plainParagraph('Probe: attach at level 1');
+    p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    p.attachToList(list.id, 1);
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: f.isListItem && f.level === 1, detail: `list.id=${list.id}; ${describeFacts(f)}` };
+  });
+
+  await probe('detachFromList() on a list item → not a list item', {}, async (s) => {
+    const p = await s.plainParagraph('Probe: detach');
+    p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+    p.startNewList();
+    await context.sync();
+    p.detachFromList();
+    await context.sync();
+    const f = await readFacts(context, p);
+    return { pass: !f.isListItem, detail: describeFacts(f) };
+  });
+
+  const bullet0 = listLevelIndents(0);
+  for (const bulletArg of [bullet0.bulletIndent, bullet0.bulletIndent - bullet0.textIndent]) {
+    const asUsed = bulletArg === bullet0.bulletIndent;
+    await probe(
+      `list.setLevelIndents(0, ${bullet0.textIndent}, ${bulletArg})${asUsed ? ' (as used by insert)' : ' (alternative: relative bullet indent)'}`,
+      { info: !asUsed },
+      async (s) => {
+        const p = await s.plainParagraph('Probe: level indents');
+        p.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+        const list = p.startNewList();
+        await context.sync();
+        list.setLevelBullet(0, Word.ListBullet.solid);
+        await context.sync();
+        list.setLevelIndents(0, bullet0.textIndent, bulletArg);
+        await context.sync();
+        const f = await readFacts(context, p);
+        const matches =
+          Math.abs(f.leftIndent - bullet0.textIndent) <= 1.5 && Math.abs(f.leftIndent + f.firstLineIndent - bullet0.bulletIndent) <= 1.5;
+        return {
+          pass: true,
+          detail: `${indentFacts(f)} → ${matches ? "matches Word's bullet button" : `does NOT match Word's bullet button (${bullet0.textIndent}/${bullet0.bulletIndent})`}`
+        };
+      }
+    );
+  }
+
+  for (const setStyleAfter of [false, true]) {
+    await probe(
+      `insertOoxml bullet item, then getOoxml(): <w:numPr>/<w:pStyle> present? (${setStyleAfter ? 'styleBuiltIn set afterwards' : 'no style set afterwards'})`,
+      { info: true },
+      async (s) => {
+        const holder = await s.plainParagraph('');
+        const xml = buildListOoxml([{ level: 0, ordered: false, inlines: [{ text: 'Probe: ooxml item' }] }]);
+        const range = holder.insertOoxml(xml, Word.InsertLocation.replace);
+        const paragraphs = range.paragraphs;
+        paragraphs.load('items/text');
+        await context.sync();
+        paragraphs.items.forEach((p) => s.created(p));
+        const first = paragraphs.items[0];
+        if (!first) return { pass: false, detail: 'insertOoxml produced no paragraph' };
+        if (setStyleAfter) {
+          first.styleBuiltIn = Word.BuiltInStyleName.listParagraph;
+          await context.sync();
+        }
+        const ooxml = first.getOoxml();
+        await context.sync();
+        const facts = ooxmlBodyFacts(ooxml.value);
+        const f = await readFacts(context, first);
+        return {
+          pass: true,
+          detail:
+            `${paragraphs.items.length} paragraph(s); isListItem=${f.isListItem}, style=${f.styleBuiltIn}; ` +
+            `<w:numPr> in body: ${facts.numPr ? 'yes' : 'no'}; <w:pStyle>: ${facts.pStyle === null ? 'no' : `yes (w:val="${facts.pStyle}")`}`
+        };
+      }
+    );
+  }
+
+  await probe('insertTable 2x2 + styleBuiltIn GridTable4 + headerRowCount 1', {}, async (s) => {
+    const holder = await s.plainParagraph('');
+    const table = holder.insertTable(2, 2, Word.InsertLocation.after, [
+      ['A', 'B'],
+      ['1', '2']
+    ]);
+    s.created(table);
+    table.styleBuiltIn = Word.BuiltInStyleName.gridTable4;
+    table.headerRowCount = 1;
+    table.load('styleBuiltIn,headerRowCount,rowCount');
+    await context.sync();
+    return {
+      pass: table.headerRowCount === 1,
+      detail: `styleBuiltIn=${table.styleBuiltIn}, headerRowCount=${table.headerRowCount}, rowCount=${table.rowCount}`
+    };
+  });
+
+  await probe('selection.isEmpty can be loaded (a collapsed cursor is never deleted)', {}, async () => {
+    const selection = context.document.getSelection();
+    selection.load('isEmpty');
+    await context.sync();
+    // Mirrors getCursor: only a non-empty selection is ever deleted, and
+    // this probe leaves Kevin's selection alone either way.
+    return { pass: true, detail: `isEmpty=${selection.isEmpty}` };
+  });
+
+  onProbe('cleanup check');
+  try {
+    const countAfter = await paragraphCount(context);
+    let tidied = 0;
+    if (countBefore !== null && countAfter > countBefore) {
+      // Probes only ever append at the end; remove empty leftovers beyond the original count.
+      const paragraphs = context.document.body.paragraphs;
+      paragraphs.load('items/text');
+      await context.sync();
+      for (const p of paragraphs.items.slice(countBefore).reverse()) {
+        if (p.text.trim() !== '') continue;
+        try {
+          p.delete();
+          await context.sync();
+          tidied++;
+        } catch {
+          /* the document's final paragraph mark can't be deleted */
+        }
+      }
+    }
+    const countFinal = tidied ? await paragraphCount(context) : countAfter;
+    const unchanged = countBefore !== null && countFinal === countBefore;
+    checks.push({
+      label: 'probe cleanup left the document as it was',
+      pass: true,
+      info: true,
+      detail:
+        `${unchanged ? 'unchanged' : 'CHANGED'}: paragraphs before: ${countBefore ?? '?'}, after probes: ${countAfter}` +
+        (tidied ? `, after removing ${tidied} empty leftover(s): ${countFinal}` : '')
+    });
+  } catch (err) {
+    checks.push({ label: 'probe cleanup left the document as it was', pass: false, info: true, detail: `threw: ${describeError(err)}` });
+  }
 
   return checks;
 }

@@ -1,8 +1,11 @@
 /// <reference types="office-js" />
 import type {
   CursorInfo,
-  OoxmlListItemInput,
+  ListState,
   ParagraphIntent,
+  ReadBackParagraph,
+  ReadBackResult,
+  ReadBackTable,
   RunFormat,
   TableStyleSettings,
   WordDocument,
@@ -11,8 +14,7 @@ import type {
   WordTableHandle
 } from './adapter';
 import type { Block } from '../model';
-import { insertBlocks, type InsertOptions } from './insert';
-import { buildListOoxml } from './ooxml';
+import { describeError, insertBlocks, type InsertOptions, type InsertReport } from './insert';
 
 /** True once, cheap: is the Word host new enough for everything this add-in needs? */
 export function isWordApi13Supported(): boolean {
@@ -30,10 +32,9 @@ function applyFormat(range: Word.Range, format: RunFormat): void {
   if (format.link) range.hyperlink = format.link;
 }
 
-class OfficeParagraphHandle implements WordParagraphHandle {
+export class OfficeParagraphHandle implements WordParagraphHandle {
   // Not private: OfficeWordDocument needs the raw Word.Paragraph proxy back
-  // for verifyAndRepairListItems (load/read isListItem) and insertOoxmlList
-  // (as an insertion anchor).
+  // for reads (list state, verify/repair, read-back).
   constructor(
     readonly paragraph: Word.Paragraph,
     private readonly context: Word.RequestContext
@@ -51,7 +52,7 @@ class OfficeParagraphHandle implements WordParagraphHandle {
     // Word represents a manual line break (Shift+Enter) within a paragraph's
     // text as a vertical tab (U+000B), both when reading Range.text back and
     // when inserting it via insertText.
-    const withBreaks = text.replace(/\n/g, '\v');
+    const withBreaks = toWordText(text);
     if (!withBreaks) return;
     const range = this.paragraph.insertText(withBreaks, Word.InsertLocation.end);
     applyFormat(range, format);
@@ -76,9 +77,13 @@ class OfficeParagraphHandle implements WordParagraphHandle {
     return new OfficeListHandle(this.paragraph.startNewList(), this.context);
   }
 
+  attachToList(listId: number, level: number): void {
+    this.paragraph.attachToList(listId, level);
+  }
+
   setListLevel(level: number): void {
-    // The throwing variant: only valid (and only called) once a prior sync
-    // has confirmed this paragraph really is a list item.
+    // The throwing variant: only called once a prior sync has made this
+    // paragraph a list item.
     this.paragraph.listItem.level = level;
   }
 
@@ -88,46 +93,31 @@ class OfficeParagraphHandle implements WordParagraphHandle {
 }
 
 class OfficeListHandle implements WordListHandle {
-  private readonly configuredLevels = new Set<number>();
-
   constructor(
     private readonly list: Word.List,
     private readonly context: Word.RequestContext
   ) {}
 
-  insertItemAfter(text: string): WordParagraphHandle {
-    return new OfficeParagraphHandle(this.list.insertParagraph(toWordText(text), Word.InsertLocation.end), this.context);
+  async getId(): Promise<number> {
+    this.list.load('id');
+    await this.context.sync();
+    return this.list.id;
   }
 
-  insertParagraphAfter(text: string): WordParagraphHandle {
-    // "After" on a List (like on a Table) inserts relative to the whole
-    // list's boundary, not as a new member — unlike "Start"/"End", which
-    // insert inside it. This is what lets a plain body paragraph follow a
-    // list without becoming another bullet/number itself.
-    return new OfficeParagraphHandle(this.list.insertParagraph(toWordText(text), Word.InsertLocation.after), this.context);
+  setLevelBullet(level: number): void {
+    this.list.setLevelBullet(level, Word.ListBullet.solid);
   }
 
-  async ensureBulletLevel(level: number): Promise<void> {
-    if (this.configuredLevels.has(level)) return;
-    this.configuredLevels.add(level);
-    try {
-      this.list.setLevelBullet(level, Word.ListBullet.solid);
-      await this.context.sync();
-    } catch (err) {
-      console.warn(`AI Paste: setLevelBullet(${level}) failed; leaving Word's default bullet formatting.`, err);
-    }
+  setLevelNumbering(level: number): void {
+    this.list.setLevelNumbering(level, Word.ListNumbering.arabic, [level, '.']);
   }
 
-  async ensureNumberLevel(level: number, startAt?: number): Promise<void> {
-    if (this.configuredLevels.has(level)) return;
-    this.configuredLevels.add(level);
-    try {
-      this.list.setLevelNumbering(level, Word.ListNumbering.arabic, [level, '.']);
-      if (startAt && startAt !== 1) this.list.setLevelStartingNumber(level, startAt);
-      await this.context.sync();
-    } catch (err) {
-      console.warn(`AI Paste: setLevelNumbering(${level}) failed; leaving Word's default number formatting.`, err);
-    }
+  setLevelIndents(level: number, textIndentPt: number, bulletIndentPt: number): void {
+    this.list.setLevelIndents(level, textIndentPt, bulletIndentPt);
+  }
+
+  setLevelStartingNumber(level: number, startingNumber: number): void {
+    this.list.setLevelStartingNumber(level, startingNumber);
   }
 }
 
@@ -185,6 +175,14 @@ function toWordText(text: string): string {
   return text.replace(/\n/g, '\v');
 }
 
+function raw(handle: WordParagraphHandle): Word.Paragraph {
+  return (handle as OfficeParagraphHandle).paragraph;
+}
+
+function numberOrNull(n: unknown): number | null {
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
+}
+
 export class OfficeWordDocument implements WordDocument {
   constructor(private readonly context: Word.RequestContext) {}
 
@@ -202,33 +200,45 @@ export class OfficeWordDocument implements WordDocument {
     }
 
     let paragraph = this.context.document.getSelection().paragraphs.getFirstOrNullObject();
-    paragraph.load('text,listOrNullObject/isNullObject');
+    paragraph.load('text,isListItem');
     await this.context.sync();
 
     if (paragraph.isNullObject) {
       const fallback = this.context.document.body.paragraphs.getLastOrNullObject();
-      fallback.load('text,listOrNullObject/isNullObject');
+      fallback.load('text,isListItem');
       await this.context.sync();
       paragraph = fallback;
     }
 
     const isEmpty = !paragraph.isNullObject && paragraph.text.trim().length === 0;
-    const list =
-      !paragraph.isNullObject && !paragraph.listOrNullObject.isNullObject
-        ? new OfficeListHandle(paragraph.listOrNullObject, this.context)
-        : null;
-    return { paragraph: new OfficeParagraphHandle(paragraph, this.context), isEmpty, list };
+    const isListItem = !paragraph.isNullObject && paragraph.isListItem;
+    return { paragraph: new OfficeParagraphHandle(paragraph, this.context), isEmpty, isListItem };
   }
 
   async commit(): Promise<void> {
     await this.context.sync();
   }
 
-  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<void> {
-    if (!records.length) return;
+  async readListState(paragraphs: WordParagraphHandle[]): Promise<ListState[]> {
+    const raws = paragraphs.map(raw);
+    const lists = raws.map((p) => p.listOrNullObject);
+    const items = raws.map((p) => p.listItemOrNullObject);
+    raws.forEach((p) => p.load('isListItem'));
+    lists.forEach((l) => l.load('id'));
+    items.forEach((i) => i.load('level'));
+    await this.context.sync();
+    return raws.map((p, i) => ({
+      isListItem: p.isListItem,
+      listId: lists[i].isNullObject ? null : lists[i].id,
+      level: items[i].isNullObject ? null : items[i].level
+    }));
+  }
 
-    const withRaw = records.map((r) => ({ ...r, raw: (r.handle as OfficeParagraphHandle).paragraph }));
-    withRaw.forEach((r) => r.raw.load('isListItem,text'));
+  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<number> {
+    if (!records.length) return 0;
+
+    const withRaw = records.map((r) => ({ ...r, raw: raw(r.handle) }));
+    withRaw.forEach((r) => r.raw.load('isListItem'));
     await this.context.sync();
 
     const toRepair = withRaw.filter((r) => !r.intendedListItem && r.raw.isListItem);
@@ -239,61 +249,77 @@ export class OfficeWordDocument implements WordDocument {
     if (toRepair.length) {
       await this.context.sync();
     }
-
-    for (const r of withRaw) {
-      if (r.intendedListItem && !r.raw.isListItem) {
-        console.warn('AI Paste: expected paragraph to be a list item after insert, but it is not:', r.raw.text);
-      }
-    }
+    return toRepair.length;
   }
 
-  async insertOoxmlList(
-    anchor: WordParagraphHandle,
-    anchorIsEmpty: boolean,
-    items: OoxmlListItemInput[]
-  ): Promise<{ items: WordParagraphHandle[]; list: WordListHandle | null }> {
-    const xml = buildListOoxml(items);
-    const anchorRaw = (anchor as OfficeParagraphHandle).paragraph;
-    const insertedRange = anchorIsEmpty
-      ? anchorRaw.insertOoxml(xml, Word.InsertLocation.replace)
-      : anchorRaw.getRange().insertOoxml(xml, Word.InsertLocation.after);
+  async readBack(first: WordParagraphHandle, last: WordParagraphHandle): Promise<ReadBackResult> {
+    const notes: string[] = [];
+    const range = raw(first)
+      .getRange(Word.RangeLocation.whole)
+      .expandTo(raw(last).getRange(Word.RangeLocation.whole));
 
-    const paragraphs = insertedRange.paragraphs;
-    paragraphs.load('items/text,items/listOrNullObject/isNullObject');
+    const collection = range.paragraphs;
+    collection.load('items/text,items/isListItem,items/styleBuiltIn,items/tableNestingLevel,items/leftIndent,items/firstLineIndent');
     await this.context.sync();
 
-    const itemCount = items.length;
-    const itemParagraphs = paragraphs.items.slice(0, itemCount);
-    for (const p of itemParagraphs) {
-      p.styleBuiltIn = 'ListParagraph' as Word.BuiltInStyleName;
-    }
+    const body = collection.items.filter((p) => !(p.tableNestingLevel > 0));
 
-    // insertOoxml can leave one stray empty paragraph after the inserted
-    // content; remove it if present (best-effort — never blocks this path).
-    if (paragraphs.items.length > itemCount) {
-      const extra = paragraphs.items[itemCount];
-      if (extra.text.trim() === '') {
-        try {
-          extra.delete();
-        } catch (err) {
-          console.warn('AI Paste: could not remove the stray paragraph after an OOXML list insert.', err);
-        }
+    // List details only for list items, in a separate sync so a failure
+    // here still leaves the basic read-back usable.
+    const listItems = body.map((p) => (p.isListItem ? p : null));
+    const ids = new Map<Word.Paragraph, Word.List>();
+    const levels = new Map<Word.Paragraph, Word.ListItem>();
+    try {
+      for (const p of listItems) {
+        if (!p) continue;
+        const list = p.listOrNullObject;
+        list.load('id');
+        ids.set(p, list);
+        const item = p.listItemOrNullObject;
+        item.load('level,listString');
+        levels.set(p, item);
       }
+      if (ids.size) await this.context.sync();
+    } catch (err) {
+      notes.push(`list ids/levels not readable (${describeError(err)})`);
+      ids.clear();
+      levels.clear();
     }
-    await this.context.sync();
 
-    const last = itemParagraphs[itemParagraphs.length - 1];
-    const list = last && !last.listOrNullObject.isNullObject ? new OfficeListHandle(last.listOrNullObject, this.context) : null;
+    const paragraphs: ReadBackParagraph[] = body.map((p) => {
+      const list = ids.get(p);
+      const item = levels.get(p);
+      return {
+        text: p.text,
+        isListItem: p.isListItem,
+        styleBuiltIn: String(p.styleBuiltIn),
+        leftIndent: numberOrNull(p.leftIndent),
+        firstLineIndent: numberOrNull(p.firstLineIndent),
+        listId: list && !list.isNullObject ? list.id : null,
+        level: item && !item.isNullObject ? item.level : null,
+        listString: item && !item.isNullObject ? item.listString : null
+      };
+    });
 
-    return { items: itemParagraphs.map((p) => new OfficeParagraphHandle(p, this.context)), list };
+    let tables: ReadBackTable[] = [];
+    try {
+      const tableCollection = range.tables;
+      tableCollection.load('items/rowCount,items/headerRowCount');
+      await this.context.sync();
+      tables = tableCollection.items.map((t) => ({ rowCount: t.rowCount, headerRowCount: t.headerRowCount }));
+    } catch (err) {
+      notes.push(`tables not readable (${describeError(err)})`);
+    }
+
+    return { paragraphs, tables, notes };
   }
 }
 
 /** Inserts the given blocks at the current cursor position in the active Word document. */
-export async function insertBlocksInWord(blocks: Block[], options: InsertOptions): Promise<void> {
-  await Word.run(async (context) => {
+export async function insertBlocksInWord(blocks: Block[], options: InsertOptions): Promise<InsertReport> {
+  return Word.run(async (context) => {
     const doc = new OfficeWordDocument(context);
-    await insertBlocks(doc, blocks, options);
+    return insertBlocks(doc, blocks, options);
   });
 }
 

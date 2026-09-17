@@ -318,3 +318,15 @@ details.options summary {
 .selftest-fail {
   color: var(--danger);
 }
+
+.selftest-info {
+  color: var(--text-muted);
+}
+
+.selftest-steps pre {
+  max-height: 200px;
+  overflow: auto;
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -7,14 +7,17 @@
  * runtime. `officeAdapter.ts` is the thin real implementation used by the
  * task pane.
  *
- * Execution model: step-wise, not one big batch. `insert.ts` calls
- * `WordDocument.commit()` after each block (occasionally twice — see
- * `WordParagraphHandle.setListLevel`), so a failure points at one block and
- * everything before it has already taken effect. A few operations that are
- * "nice to have but not worth failing the whole paste over" — configuring a
- * list level's bullet/number format, applying a table style — do their own
- * internal sync, catch their own errors, and simply log and continue rather
- * than throwing; see their doc comments below.
+ * Execution model: step-wise, not one big batch. Methods returning `void`
+ * only QUEUE work; `insert.ts` calls `WordDocument.commit()` after each
+ * block / list step so a failure points at one step. Methods returning a
+ * Promise do their own load + sync.
+ *
+ * Deliberately absent: `Word.List.insertParagraph`. On Word for Mac
+ * (16.113) `list.insertParagraph(text, "End")` does not add the paragraph
+ * to the list — it lands directly after the list's current range (which
+ * stays just the first item), so repeated calls come out in reverse order —
+ * and `"After"` behaves the same way. See insert.ts for the two-phase
+ * design that replaced it.
  */
 
 export interface RunFormat {
@@ -35,76 +38,61 @@ export interface WordParagraphHandle {
   /**
    * Applies bold/italic/font/link formatting to this paragraph's entire
    * current text. Meant to be called right after creating the paragraph
-   * WITH its first run's text already passed to `insertParagraphAfter` /
-   * `WordListHandle.insertItemAfter` — i.e. instead of ever creating an
-   * empty paragraph and then filling it, the first run's text is there
-   * from the moment of creation, and this just formats it. No-op-safe on
-   * a genuinely empty paragraph (a blank spacer).
+   * WITH its first run's text already passed to `insertParagraphAfter`.
+   * No-op-safe on a genuinely empty paragraph (a blank spacer).
    */
   setWholeTextFormat(format: RunFormat): void;
   /**
-   * Creates a new paragraph after this one, with `text` as its content
-   * from the moment of creation (pass "" for a genuinely empty spacer
-   * paragraph), and returns it.
+   * Creates a new paragraph directly after this one, with `text` as its
+   * content from the moment of creation (pass "" for an empty spacer
+   * paragraph), and returns it. This is the only way insert.ts creates
+   * paragraphs next to other paragraphs; it keeps document order and
+   * styles on Word for Mac.
    *
-   * NOTE: in real Word, calling this on a paragraph that is currently a
-   * list item usually creates *another list item* (the same thing that
-   * happens when you press Enter at the end of a list line) — setting a
-   * style afterwards does not reliably remove that list membership.
-   * Callers that want a plain, non-list paragraph after a list must go
-   * through `WordListHandle.insertParagraphAfter()` instead (see
-   * insert.ts), and everything is additionally checked and repaired after
-   * the main sync — see `WordDocument.verifyAndRepairListItems`.
+   * NOTE: if THIS paragraph is a list item, real Word may make the new
+   * paragraph a list item too (like pressing Enter at the end of a list
+   * line). insert.ts only ever calls this on paragraphs that are not list
+   * items yet (all lists are created afterwards, in phase 2), except for a
+   * cursor paragraph that already was one — handled explicitly there.
    */
   insertParagraphAfter(text: string): WordParagraphHandle;
   /** Creates a table after this paragraph with plain-text cell values and returns it. */
   insertTableAfter(values: string[][]): WordTableHandle;
-  /**
-   * Starts a brand new Word list with this paragraph as its first (level
-   * 0) item. Only call this on a paragraph that already has its text (see
-   * `insertParagraphAfter`) — starting a list on a still-empty paragraph
-   * is suspected of being one cause of Word throwing a bare
-   * `GeneralException` on this operation.
-   */
+  /** Starts a brand new Word list with this paragraph as its first (level 0) item. */
   startNewList(): WordListHandle;
   /**
-   * Marks this paragraph as level `level` of an already-open list
-   * (paragraph must already be a confirmed member — see
-   * `WordListHandle.insertItemAfter`). Only call this AFTER a
-   * `WordDocument.commit()` that happened after the paragraph joined the
-   * list — setting the level in the same unsynced batch as the join is
-   * the other suspected `GeneralException` cause.
+   * Makes this (plain, non-list) paragraph an item of the existing list
+   * `listId` at `level`. Word fails this call if the paragraph already is
+   * a list item.
+   */
+  attachToList(listId: number, level: number): void;
+  /**
+   * Sets this list item's level. Only call it AFTER a commit that followed
+   * the paragraph joining a list (it uses the throwing `listItem` accessor).
    */
   setListLevel(level: number): void;
   /**
-   * Removes this paragraph from whatever list it belongs to, if any
-   * (no-op otherwise). Only call this on a paragraph whose list-item
-   * status was actually confirmed by a prior load+sync (never
-   * speculatively) — see insert.ts's callers.
+   * Removes this paragraph from its list, if any. Only call this on a
+   * paragraph whose list-item status was confirmed by a prior read.
    */
   detachFromList(): void;
 }
 
 export interface WordListHandle {
-  /** Appends a new paragraph as a member of this list (default level 0), with `text` as its content from creation, and returns it. */
-  insertItemAfter(text: string): WordParagraphHandle;
+  /** Loads and returns this list's numeric id (own sync). */
+  getId(): Promise<number>;
+  /** Queues: level `level` shows a solid bullet. */
+  setLevelBullet(level: number): void;
+  /** Queues: level `level` shows simple Arabic numbering, "1.". */
+  setLevelNumbering(level: number): void;
   /**
-   * Creates a new paragraph immediately after the *whole list* (not a
-   * member of it), with `text` as its content from creation, and returns
-   * it — the correct way to get back to plain body content right after a
-   * list.
+   * Queues `List.setLevelIndents(level, textIndentPt, bulletIndentPt)`.
+   * insert.ts passes the geometry of Word's own bullet button — see
+   * `listLevelIndents` there.
    */
-  insertParagraphAfter(text: string): WordParagraphHandle;
-  /**
-   * Configures level `level` as a bullet level, once (idempotent per
-   * level). Syncs and catches its own errors: if Word rejects the
-   * formatting call, this logs a warning and resolves anyway, leaving the
-   * level at Word's default bullet/number formatting rather than failing
-   * the whole insert over a cosmetic setting.
-   */
-  ensureBulletLevel(level: number): Promise<void>;
-  /** Same as `ensureBulletLevel`, but for a simple "1." Arabic numbering level. */
-  ensureNumberLevel(level: number, startAt?: number): Promise<void>;
+  setLevelIndents(level: number, textIndentPt: number, bulletIndentPt: number): void;
+  /** Queues: level `level` starts counting at `startingNumber`. */
+  setLevelStartingNumber(level: number, startingNumber: number): void;
 }
 
 export interface TableStyleSettings {
@@ -130,22 +118,20 @@ export interface WordTableHandle {
    */
   applyStyle(settings: TableStyleSettings): Promise<void>;
   /**
-   * Creates and returns a brand new paragraph immediately after the table
-   * (pushing anything that already followed it further down). Only call
-   * this when more of our own blocks still need to be inserted after the
-   * table — if the table is the last thing we insert, leave it alone and
-   * rely on Word's own structural paragraph after a trailing table.
+   * Creates and returns a new paragraph (with `text` from creation)
+   * directly after the table. insert.ts only calls this when another of
+   * our own blocks follows the table.
    */
   insertParagraphAfter(text: string): WordParagraphHandle;
 }
 
 export interface CursorInfo {
-  /** The (now-empty, reusable) paragraph at the insertion point. A non-empty selection is deleted first. */
+  /** The paragraph at the insertion point. A non-empty selection is deleted first. */
   paragraph: WordParagraphHandle;
   /** True when that paragraph has no visible text, so the first inserted block can reuse it. */
   isEmpty: boolean;
-  /** The list the cursor paragraph currently belongs to, if any (confirmed via a load, never guessed). */
-  list: WordListHandle | null;
+  /** Whether that paragraph is currently a list item (confirmed via a load, never guessed). */
+  isListItem: boolean;
 }
 
 /** One paragraph we inserted/touched, and whether it was meant to end up as a list item. */
@@ -156,40 +142,61 @@ export interface ParagraphIntent {
   reapplyStyle?: () => void;
 }
 
-/** One list item for the `insertOoxmlList` fallback (see src/word/ooxml.ts). */
-export interface OoxmlListItemInput {
-  level: number;
-  ordered: boolean;
-  inlines: import('../model').Inline[];
+/** List state of one paragraph, as read back from the document. */
+export interface ListState {
+  isListItem: boolean;
+  /** Id of the list the paragraph belongs to, or null (not a list item, or not readable). */
+  listId: number | null;
+  /** The paragraph's list level, or null. */
+  level: number | null;
+}
+
+/** One paragraph as read back from the document, in document order. */
+export interface ReadBackParagraph {
+  text: string;
+  isListItem: boolean;
+  /** `Paragraph.styleBuiltIn` ("Other" for a custom style). */
+  styleBuiltIn: string;
+  leftIndent: number | null;
+  firstLineIndent: number | null;
+  listId: number | null;
+  level: number | null;
+  /** The rendered bullet/number, e.g. "1." — null if not a list item or unreadable. */
+  listString: string | null;
+}
+
+export interface ReadBackTable {
+  rowCount: number;
+  headerRowCount: number;
+}
+
+export interface ReadBackResult {
+  /** Body paragraphs from the first to the last given paragraph, in document order (table-cell paragraphs excluded). */
+  paragraphs: ReadBackParagraph[];
+  /** Tables inside that range. */
+  tables: ReadBackTable[];
+  /** Anything that could not be read (e.g. list ids), for the step log. */
+  notes: string[];
 }
 
 export interface WordDocument {
   /** Reads the cursor position. Deletes a non-empty selection first (never inserts "" — see officeAdapter). */
   getCursor(): Promise<CursorInfo>;
-  /** Flushes all queued operations. Called after every block (and once more after a nested list item's level is set). */
+  /** Flushes all queued operations. */
   commit(): Promise<void>;
+  /** Reads list membership, list id and level of each paragraph (one sync). */
+  readListState(paragraphs: WordParagraphHandle[]): Promise<ListState[]>;
   /**
-   * Safety net for the "paragraph after a list stays a list item" Word
-   * quirk: loads `isListItem` for every tracked paragraph, syncs, then for
-   * each paragraph that was NOT meant to be a list item but is one anyway,
-   * detaches it and re-applies its intended style (syncing once more).
-   * Paragraphs that were meant to be list items but aren't are only
-   * logged via console.warn — not auto-fixed, since we can't safely guess
-   * which list they should have joined.
+   * Safety net: loads `isListItem` for every tracked paragraph and, for
+   * each one that was NOT meant to be a list item but is one anyway,
+   * detaches it and re-applies its intended style. Returns how many
+   * paragraphs it repaired. Missing list items are reported by the
+   * read-back (phase 3), not here.
    */
-  verifyAndRepairListItems(records: ParagraphIntent[]): Promise<void>;
+  verifyAndRepairListItems(records: ParagraphIntent[]): Promise<number>;
   /**
-   * Fallback for when the paragraph/list API path throws while starting or
-   * continuing a list: inserts the whole `items` run at once via raw OOXML
-   * (see src/word/ooxml.ts). Replaces `anchor` if `anchorIsEmpty`,
-   * otherwise inserts after it. Syncs internally. Returns a handle per
-   * item (already styled "ListParagraph") and — best-effort — the real
-   * `Word.List` those items ended up on, so anything that follows can
-   * still use the normal list-escape logic.
+   * Reads back every body paragraph from `first` to `last` (inclusive), in
+   * document order, plus the tables in between.
    */
-  insertOoxmlList(
-    anchor: WordParagraphHandle,
-    anchorIsEmpty: boolean,
-    items: OoxmlListItemInput[]
-  ): Promise<{ items: WordParagraphHandle[]; list: WordListHandle | null }>;
+  readBack(first: WordParagraphHandle, last: WordParagraphHandle): Promise<ReadBackResult>;
 }

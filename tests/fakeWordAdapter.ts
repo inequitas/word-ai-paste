@@ -1,7 +1,9 @@
 import type {
   CursorInfo,
-  OoxmlListItemInput,
+  ListState,
   ParagraphIntent,
+  ReadBackParagraph,
+  ReadBackResult,
   RunFormat,
   TableStyleSettings,
   WordDocument,
@@ -11,22 +13,25 @@ import type {
 } from '../src/word/adapter';
 
 /**
- * A tiny in-memory recording implementation of the Word adapter interfaces,
- * used to unit-test src/word/insert.ts without a real Word runtime.
+ * A small in-memory implementation of the Word adapter interfaces, used to
+ * unit-test src/word/insert.ts without a real Word runtime.
  *
- * It deliberately reproduces one real-Word quirk: calling
- * `insertParagraphAfter()` on a paragraph that is currently a list item
- * creates *another list item* of the same list/level, the same way
- * pressing Enter at the end of a list line does in real Word. That's the
- * exact behavior src/word/insert.ts has to route around (via
- * `WordListHandle.insertParagraphAfter()` instead) and its
- * verify-and-repair pass has to catch as a safety net.
+ * Real-Word behaviour it reproduces on purpose:
+ * - `insertParagraphAfter()` on a paragraph that is a list item creates
+ *   another item of the same list/level (like pressing Enter at the end of
+ *   a list line).
+ * - The Word-for-Mac 16.113 quirk: `FakeList.insertParagraph(text, "End" |
+ *   "After")` inserts directly after the list's FIRST paragraph and does not
+ *   join the list, so repeated calls come out in reverse order. It is not
+ *   part of the adapter interface (insert.ts must never use it); tests
+ *   call it directly to show the fake matches what Kevin saw in Word.
+ * - `attachToList()` throws for a paragraph that already is a list item.
+ * - Numbers in `listString` follow the list's members in document order.
  *
- * It can also simulate the GeneralException Kevin actually hit: call
- * `FakeWordDocument.failNext('startNewList' | 'insertItemAfter' |
- * 'setListLevel')` to make the next matching call throw a fake
- * Office.js-shaped error, so tests can exercise insert.ts's OOXML fallback
- * path without a real Word runtime.
+ * Failure injection: `failNext(action, times, skip)` makes calls to that
+ * action throw an Office.js-shaped error (after `skip` successful ones);
+ * `attachToListIsNoop = true`
+ * makes `attachToList` silently do nothing (isListItem stays false).
  */
 
 export interface FakeRun {
@@ -44,8 +49,6 @@ export interface FakeParagraph {
   /** One array per line — a hard line break starts a new line array. */
   lines: FakeRun[][];
   listRef?: { list: FakeList; level: number };
-  /** Set on paragraphs created by the OOXML fallback, for assertions. */
-  viaOoxml?: boolean;
 }
 
 export interface FakeTable {
@@ -80,6 +83,7 @@ export class FakeOfficeError extends Error {
 
 class FakeDocumentModel {
   blocks: FakeBlock[] = [];
+  lists: FakeList[] = [];
 }
 
 function insertAfter(model: FakeDocumentModel, anchor: FakeBlock, block: FakeBlock): void {
@@ -92,7 +96,13 @@ function emptyParagraph(): FakeParagraph {
   return { kind: 'paragraph', lines: [[]] };
 }
 
-function fillFirstRun(p: FakeParagraph, text: string, format: RunFormat): void {
+function paragraphWithText(text: string): FakeParagraph {
+  const p = emptyParagraph();
+  if (text) appendText(p, text, { bold: false, italic: false });
+  return p;
+}
+
+function appendText(p: FakeParagraph, text: string, format: RunFormat): void {
   const segments = text.split('\n');
   segments.forEach((seg, i) => {
     if (i > 0) p.lines.push([]);
@@ -108,7 +118,7 @@ function fillFirstRun(p: FakeParagraph, text: string, format: RunFormat): void {
   });
 }
 
-class FakeParagraphHandle implements WordParagraphHandle {
+export class FakeParagraphHandle implements WordParagraphHandle {
   constructor(
     private readonly model: FakeDocumentModel,
     private readonly doc: FakeWordDocument,
@@ -126,7 +136,7 @@ class FakeParagraphHandle implements WordParagraphHandle {
   }
 
   insertRun(text: string, format: RunFormat): void {
-    fillFirstRun(this.para, text, format);
+    appendText(this.para, text, format);
   }
 
   setWholeTextFormat(format: RunFormat): void {
@@ -141,17 +151,12 @@ class FakeParagraphHandle implements WordParagraphHandle {
   }
 
   insertParagraphAfter(text: string): WordParagraphHandle {
-    const p = emptyParagraph();
-    if (text) fillFirstRun(p, text, { bold: false, italic: false });
-    // Mirrors real Word: a paragraph inserted right after a list item
-    // becomes another item of that same list/level unless something
-    // explicitly detaches it.
-    if (this.para.listRef) {
-      const { list, level } = this.para.listRef;
-      p.listRef = { list, level };
-      list.members.push(p);
-    }
+    this.doc.fire('insertParagraphAfter');
+    const p = paragraphWithText(text);
     insertAfter(this.model, this.para, p);
+    // Mirrors real Word: a paragraph inserted right after a list item
+    // becomes another item of that same list/level.
+    if (this.para.listRef) this.para.listRef.list.join(p, this.para.listRef.level);
     return new FakeParagraphHandle(this.model, this.doc, p);
   }
 
@@ -161,66 +166,113 @@ class FakeParagraphHandle implements WordParagraphHandle {
     return new FakeTableHandle(this.model, this.doc, t);
   }
 
-  startNewList(): WordListHandle {
-    if (this.doc.consumeFailure('startNewList')) throw new FakeOfficeError('Word.Paragraph.startNewList');
+  startNewList(): FakeList {
+    this.doc.fire('startNewList');
+    if (this.para.listRef) this.para.listRef.list.leave(this.para);
     const list = new FakeList(this.model, this.doc);
-    this.para.listRef = { list, level: 0 };
-    list.members.push(this.para);
+    list.join(this.para, 0);
     return list;
   }
 
+  attachToList(listId: number, level: number): void {
+    this.doc.fire('attachToList');
+    if (this.doc.attachToListIsNoop) return;
+    if (this.para.listRef) throw new FakeOfficeError('Word.Paragraph.attachToList (already a list item)');
+    const list = this.model.lists.find((l) => l.id === listId);
+    if (!list) throw new FakeOfficeError(`Word.Paragraph.attachToList (no list ${listId})`);
+    list.join(this.para, level);
+  }
+
   setListLevel(level: number): void {
-    if (this.doc.consumeFailure('setListLevel')) throw new FakeOfficeError('Word.ListItem.level');
-    if (this.para.listRef) this.para.listRef.level = level;
+    this.doc.fire('setListLevel');
+    if (!this.para.listRef) throw new FakeOfficeError('Word.Paragraph.listItem (not a list item)');
+    this.para.listRef.level = level;
   }
 
   detachFromList(): void {
-    if (!this.para.listRef) return;
-    const { list } = this.para.listRef;
-    const idx = list.members.indexOf(this.para);
-    if (idx !== -1) list.members.splice(idx, 1);
-    this.para.listRef = undefined;
+    if (this.para.listRef) this.para.listRef.list.leave(this.para);
   }
 }
 
-class FakeList implements WordListHandle {
+let nextListId = 1000;
+
+export class FakeList implements WordListHandle {
+  readonly id = nextListId++;
+  /** Member paragraphs, kept in document order. */
   members: FakeParagraph[] = [];
   readonly bulletLevels = new Set<number>();
-  readonly numberLevels = new Map<number, number>();
+  readonly numberLevels = new Set<number>();
+  readonly startingNumbers = new Map<number, number>();
+  readonly levelIndents = new Map<number, { textIndent: number; bulletIndent: number }>();
 
   constructor(
     private readonly model: FakeDocumentModel,
     private readonly doc: FakeWordDocument
-  ) {}
+  ) {
+    model.lists.push(this);
+  }
 
-  insertItemAfter(text: string): WordParagraphHandle {
-    if (this.doc.consumeFailure('insertItemAfter')) throw new FakeOfficeError('Word.List.insertParagraph');
-    const last = this.members[this.members.length - 1];
-    const p = emptyParagraph();
-    if (text) fillFirstRun(p, text, { bold: false, italic: false });
-    p.listRef = { list: this, level: 0 };
-    insertAfter(this.model, last, p);
+  join(p: FakeParagraph, level: number): void {
+    p.listRef = { list: this, level };
     this.members.push(p);
+    this.members.sort((a, b) => this.model.blocks.indexOf(a) - this.model.blocks.indexOf(b));
+  }
+
+  leave(p: FakeParagraph): void {
+    const idx = this.members.indexOf(p);
+    if (idx !== -1) this.members.splice(idx, 1);
+    p.listRef = undefined;
+  }
+
+  /**
+   * NOT part of WordListHandle. Reproduces Word for Mac: the new paragraph
+   * lands directly after the list's first paragraph and is not a member.
+   */
+  insertParagraph(text: string, _location: 'End' | 'After'): FakeParagraphHandle {
+    const p = paragraphWithText(text);
+    insertAfter(this.model, this.members[0], p);
     return new FakeParagraphHandle(this.model, this.doc, p);
   }
 
-  insertParagraphAfter(text: string): WordParagraphHandle {
-    // Inserted after the whole list (after its last member), and — unlike
-    // insertItemAfter — never a member of it.
-    const last = this.members[this.members.length - 1];
-    const p = emptyParagraph();
-    if (text) fillFirstRun(p, text, { bold: false, italic: false });
-    insertAfter(this.model, last, p);
-    return new FakeParagraphHandle(this.model, this.doc, p);
+  async getId(): Promise<number> {
+    this.doc.fire('getId');
+    return this.id;
   }
 
-  async ensureBulletLevel(level: number): Promise<void> {
+  setLevelBullet(level: number): void {
+    this.doc.fire('setLevelBullet');
     this.bulletLevels.add(level);
+    this.numberLevels.delete(level);
   }
 
-  async ensureNumberLevel(level: number, startAt?: number): Promise<void> {
-    if (this.numberLevels.has(level)) return;
-    this.numberLevels.set(level, startAt ?? 1);
+  setLevelNumbering(level: number): void {
+    this.doc.fire('setLevelNumbering');
+    this.numberLevels.add(level);
+    this.bulletLevels.delete(level);
+  }
+
+  setLevelIndents(level: number, textIndent: number, bulletIndent: number): void {
+    this.doc.fire('setLevelIndents');
+    this.levelIndents.set(level, { textIndent, bulletIndent });
+  }
+
+  setLevelStartingNumber(level: number, startingNumber: number): void {
+    this.doc.fire('setLevelStartingNumber');
+    this.startingNumbers.set(level, startingNumber);
+  }
+
+  /** The bullet/number Word would show for `p`. */
+  listString(p: FakeParagraph): string {
+    const level = p.listRef!.level;
+    if (!this.numberLevels.has(level)) return '•';
+    let n = (this.startingNumbers.get(level) ?? 1) - 1;
+    for (const m of this.members) {
+      const l = m.listRef!.level;
+      if (l < level) n = (this.startingNumbers.get(level) ?? 1) - 1;
+      if (l === level) n++;
+      if (m === p) break;
+    }
+    return `${n}.`;
   }
 }
 
@@ -236,52 +288,83 @@ class FakeTableHandle implements WordTableHandle {
   }
 
   insertParagraphAfter(text: string): WordParagraphHandle {
-    const p = emptyParagraph();
-    if (text) fillFirstRun(p, text, { bold: false, italic: false });
+    const p = paragraphWithText(text);
     insertAfter(this.model, this.table, p);
     return new FakeParagraphHandle(this.model, this.doc, p);
   }
 }
 
-type FailableAction = 'startNewList' | 'insertItemAfter' | 'setListLevel';
+export type FailableAction =
+  | 'insertParagraphAfter'
+  | 'startNewList'
+  | 'attachToList'
+  | 'setListLevel'
+  | 'getId'
+  | 'setLevelBullet'
+  | 'setLevelNumbering'
+  | 'setLevelIndents'
+  | 'setLevelStartingNumber'
+  | 'readBack';
+
+/** List Paragraph style's own indent, used for a ListParagraph paragraph that is not (yet) a list item. */
+const LIST_PARAGRAPH_STYLE_INDENT = 36;
 
 export class FakeWordDocument implements WordDocument {
   readonly model = new FakeDocumentModel();
-  private readonly anchor: FakeParagraph;
-  private readonly anchorList: FakeList | null = null;
+  readonly anchor: FakeParagraph;
   commitCount = 0;
-  /** Diagnostics for tests: how many paragraphs the repair pass detached + restyled, and any warnings it logged. */
+  /** How many paragraphs the repair pass detached + restyled. */
   repairedCount = 0;
-  warnings: string[] = [];
-  /** Records of every insertOoxmlList call, for assertions. */
-  ooxmlCalls: { anchorIsEmpty: boolean; items: OoxmlListItemInput[] }[] = [];
+  /** When true, attachToList() silently does nothing. */
+  attachToListIsNoop = false;
+  /** Every call to a failable action, in order. */
+  readonly calls: FailableAction[] = [];
 
-  private failing = new Set<FailableAction>();
+  private failing = new Map<FailableAction, { skip: number; times: number }>();
 
-  constructor(options: { anchorText?: string; anchorInList?: boolean } = {}) {
-    this.anchor = emptyParagraph();
-    if (options.anchorText) {
-      this.anchor.lines[0].push({ text: options.anchorText, bold: false, italic: false });
-    }
-    if (options.anchorInList) {
-      const list = new FakeList(this.model, this);
-      this.anchor.listRef = { list, level: 0 };
-      list.members.push(this.anchor);
-      this.anchorList = list;
-    }
+  /**
+   * @param options.anchorText   text of the cursor paragraph ("" = empty, reusable)
+   * @param options.anchorInList the cursor paragraph is an item of an existing list
+   * @param options.trailingText existing document content after the cursor paragraph
+   */
+  constructor(options: { anchorText?: string; anchorInList?: boolean; trailingText?: string } = {}) {
+    this.anchor = paragraphWithText(options.anchorText ?? '');
     this.model.blocks.push(this.anchor);
+    if (options.anchorInList) {
+      new FakeList(this.model, this).join(this.anchor, 0);
+    }
+    if (options.trailingText !== undefined) {
+      this.model.blocks.push(paragraphWithText(options.trailingText));
+    }
   }
 
-  /** Test hook: make the next call to this action throw a FakeOfficeError (one-shot). */
-  failNext(action: FailableAction): void {
-    this.failing.add(action);
+  /** Test hook: after `skip` successful calls, make the next `times` calls to this action throw a FakeOfficeError. */
+  failNext(action: FailableAction, times = 1, skip = 0): void {
+    this.failing.set(action, { skip, times });
   }
 
-  /** Internal: called by the fake handles; returns true (and clears the flag) exactly once per failNext() call. */
-  consumeFailure(action: FailableAction): boolean {
-    if (!this.failing.has(action)) return false;
-    this.failing.delete(action);
-    return true;
+  /** Internal: records the call and throws if a failure was requested for it. */
+  fire(action: FailableAction): void {
+    this.calls.push(action);
+    const plan = this.failing.get(action);
+    if (!plan) return;
+    if (plan.skip > 0) {
+      plan.skip--;
+      return;
+    }
+    if (plan.times > 0) {
+      plan.times--;
+      throw new FakeOfficeError(`Word.${action}`);
+    }
+  }
+
+  /** Every paragraph's text, in document order. */
+  texts(): string[] {
+    return this.paragraphs.map(paragraphText);
+  }
+
+  get paragraphs(): FakeParagraph[] {
+    return this.model.blocks.filter(isParagraph);
   }
 
   async getCursor(): Promise<CursorInfo> {
@@ -289,7 +372,7 @@ export class FakeWordDocument implements WordDocument {
     return {
       paragraph: new FakeParagraphHandle(this.model, this, this.anchor),
       isEmpty,
-      list: this.anchorList
+      isListItem: Boolean(this.anchor.listRef)
     };
   }
 
@@ -297,65 +380,59 @@ export class FakeWordDocument implements WordDocument {
     this.commitCount++;
   }
 
-  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<void> {
+  async readListState(paragraphs: WordParagraphHandle[]): Promise<ListState[]> {
+    return paragraphs.map((h) => {
+      const ref = (h as FakeParagraphHandle).para.listRef;
+      return { isListItem: Boolean(ref), listId: ref ? ref.list.id : null, level: ref ? ref.level : null };
+    });
+  }
+
+  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<number> {
+    let repaired = 0;
     for (const r of records) {
       const para = (r.handle as FakeParagraphHandle).para;
-      const isListItem = Boolean(para.listRef);
-      if (!r.intendedListItem && isListItem) {
+      if (!r.intendedListItem && para.listRef) {
         r.handle.detachFromList();
         r.reapplyStyle?.();
-        this.repairedCount++;
-      } else if (r.intendedListItem && !isListItem) {
-        this.warnings.push(`expected list item, found none: ${paragraphText(para)}`);
+        repaired++;
       }
     }
+    this.repairedCount += repaired;
+    return repaired;
   }
 
-  async insertOoxmlList(
-    anchor: WordParagraphHandle,
-    anchorIsEmpty: boolean,
-    items: OoxmlListItemInput[]
-  ): Promise<{ items: WordParagraphHandle[]; list: WordListHandle | null }> {
-    this.ooxmlCalls.push({ anchorIsEmpty, items });
-
-    const anchorPara = (anchor as FakeParagraphHandle).para;
-    const list = new FakeList(this.model, this);
-    const created: FakeParagraph[] = [];
-
-    const fillFromItem = (p: FakeParagraph, item: OoxmlListItemInput): void => {
-      p.styleBuiltIn = 'ListParagraph';
-      p.styleName = undefined;
-      p.viaOoxml = true;
-      const first = item.inlines[0];
-      const text = item.inlines.map((i) => i.text).join('');
-      if (text) fillFirstRun(p, text, { bold: !!first?.bold, italic: !!first?.italic });
-      p.listRef = { list, level: item.level };
-      list.members.push(p);
+  async readBack(first: WordParagraphHandle, last: WordParagraphHandle): Promise<ReadBackResult> {
+    this.fire('readBack');
+    const from = this.model.blocks.indexOf((first as FakeParagraphHandle).para);
+    const to = this.model.blocks.indexOf((last as FakeParagraphHandle).para);
+    if (from === -1 || to === -1 || to < from) throw new Error('fake adapter: bad read-back range');
+    const slice = this.model.blocks.slice(from, to + 1);
+    return {
+      paragraphs: slice.filter(isParagraph).map((p) => readBackOf(p)),
+      tables: slice.filter(isTable).map((t) => ({ rowCount: t.values.length, headerRowCount: t.style?.headerRowCount ?? 0 })),
+      notes: []
     };
-
-    let anchorBlock: FakeBlock;
-    let startFromIndex: number;
-
-    if (anchorIsEmpty) {
-      // "Replace": reuse the anchor paragraph itself as item 0.
-      anchorPara.lines = [[]];
-      if (items[0]) fillFromItem(anchorPara, items[0]);
-      created.push(anchorPara);
-      anchorBlock = anchorPara;
-      startFromIndex = 1;
-    } else {
-      anchorBlock = anchorPara;
-      startFromIndex = 0;
-    }
-
-    for (let i = startFromIndex; i < items.length; i++) {
-      const p = emptyParagraph();
-      fillFromItem(p, items[i]);
-      insertAfter(this.model, anchorBlock, p);
-      anchorBlock = p;
-      created.push(p);
-    }
-
-    return { items: created.map((p) => new FakeParagraphHandle(this.model, this, p)), list };
   }
+}
+
+export function readBackOf(p: FakeParagraph): ReadBackParagraph {
+  const ref = p.listRef;
+  let leftIndent = p.styleBuiltIn === 'ListParagraph' ? LIST_PARAGRAPH_STYLE_INDENT : 0;
+  let firstLineIndent = 0;
+  if (ref) {
+    // Without setLevelIndents, model the "much deeper" default indent Kevin saw.
+    const indents = ref.list.levelIndents.get(ref.level) ?? { textIndent: 90 + 36 * ref.level, bulletIndent: 72 + 36 * ref.level };
+    leftIndent = indents.textIndent;
+    firstLineIndent = indents.bulletIndent - indents.textIndent;
+  }
+  return {
+    text: paragraphText(p).replace(/\n/g, ''),
+    isListItem: Boolean(ref),
+    styleBuiltIn: p.styleBuiltIn ?? (p.styleName ? 'Other' : 'Normal'),
+    leftIndent,
+    firstLineIndent,
+    listId: ref ? ref.list.id : null,
+    level: ref ? ref.level : null,
+    listString: ref ? ref.list.listString(p) : null
+  };
 }

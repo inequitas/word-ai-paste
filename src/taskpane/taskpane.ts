@@ -3,7 +3,14 @@ import { parseMarkdown } from '../parse/markdown';
 import { parseHtml } from '../parse/html';
 import { detectFormat, formatLabel, type DetectedFormat } from '../parse/detect';
 import { normalize, type NormalizeOptions } from '../transform/normalize';
-import { DEFAULT_TABLE_STYLE, InsertError, type InsertOptions, type StepLogEntry } from '../word/insert';
+import {
+  DEFAULT_TABLE_STYLE,
+  InsertError,
+  formatStep,
+  type InsertOptions,
+  type InsertReport,
+  type StepLogEntry
+} from '../word/insert';
 import {
   loadNormalizeOptions,
   saveNormalizeOptions,
@@ -263,8 +270,15 @@ async function onInsertClick(): Promise<void> {
   setStatus('Inserting…', 'idle');
   try {
     const { insertBlocksInWord } = await import('../word/officeAdapter');
-    await insertBlocksInWord(state.blocks, buildInsertOptions());
-    setStatus(`Inserted ${state.blocks.length} block${state.blocks.length === 1 ? '' : 's'}.`, 'ok');
+    const report = await insertBlocksInWord(state.blocks, buildInsertOptions());
+    const inserted = `Inserted ${state.blocks.length} block${state.blocks.length === 1 ? '' : 's'}`;
+    const problems = report.mismatches.length + (report.verifyError ? 1 : 0);
+    if (problems) {
+      setStatus(`${inserted}, but the check afterwards found ${problems} problem${problems === 1 ? '' : 's'}. See details.`, 'error');
+      showReportDetails(report);
+    } else {
+      setStatus(`${inserted}.`, 'ok');
+    }
   } catch (err) {
     if (err instanceof InsertError) {
       setStatus(`Insert failed: ${err.officeError.message}`, 'error');
@@ -283,46 +297,65 @@ function hideErrorDetails(): void {
   lastCopyPayload = null;
 }
 
-function showErrorDetails(err: InsertError): void {
-  const step = err.failedStep;
-  const lines = [
-    step ? `Failed step: block ${step.blockIndex} (${step.blockType}): ${step.action}` : 'Failed during setup',
-    `code: ${err.officeError.code ?? '(none)'}`,
-    `message: ${err.officeError.message}`,
-    `errorLocation: ${err.officeError.errorLocation ?? '(none)'}`,
-    `statement: ${err.officeError.statement ?? '(none)'}`
-  ];
+function showDetails(lines: string[], payload: Record<string, unknown>): void {
   el.errorDetailsText.textContent = lines.join('\n');
   el.errorDetails.hidden = false;
   el.copyErrorFeedback.hidden = true;
-  lastCopyPayload = formatStepLogForCopy(err.officeError, step, err.steps);
+  lastCopyPayload = JSON.stringify(
+    { version: `${__APP_VERSION__} (${__GIT_HASH__})`, when: new Date().toISOString(), ...payload },
+    null,
+    2
+  );
 }
 
-function formatStepLogForCopy(
-  officeError: { code?: string; message: string; errorLocation?: string; statement?: string },
-  failedStep: StepLogEntry | null,
-  steps: StepLogEntry[]
-): string {
-  const payload = {
-    version: `${__APP_VERSION__} (${__GIT_HASH__})`,
-    when: new Date().toISOString(),
-    officeError,
-    failedStep,
-    steps: steps.map((s) => `block ${s.blockIndex} ${s.blockType}: ${s.action}`)
-  };
-  return JSON.stringify(payload, null, 2);
+function showErrorDetails(err: InsertError): void {
+  const step = err.failedStep;
+  showDetails(
+    [
+      step ? `Failed step: block ${step.blockIndex} (${step.blockType}): ${step.action}` : 'Failed during setup',
+      `code: ${err.officeError.code ?? '(none)'}`,
+      `message: ${err.officeError.message}`,
+      `errorLocation: ${err.officeError.errorLocation ?? '(none)'}`,
+      `statement: ${err.officeError.statement ?? '(none)'}`
+    ],
+    { officeError: err.officeError, failedStep: step, steps: stepLines(err.steps) }
+  );
+}
+
+/** After a successful insert whose read-back didn't match what was intended. */
+function showReportDetails(report: InsertReport): void {
+  const lines = [
+    ...(report.verifyError ? [`read-back failed: ${report.verifyError}`] : []),
+    ...report.mismatches,
+    ...report.runs.filter((r) => r.mode === 'per-item').map((r) => `list ${r.run}: per-item-lists fallback from item ${(r.fallbackFrom ?? 0) + 1}`)
+  ];
+  showDetails(lines, {
+    mismatches: report.mismatches,
+    verifyError: report.verifyError,
+    runs: report.runs,
+    repaired: report.repaired,
+    steps: stepLines(report.steps)
+  });
+}
+
+function stepLines(steps: StepLogEntry[]): string[] {
+  return steps.map(formatStep);
 }
 
 interface SelfTestCheckLike {
   label: string;
   pass: boolean;
   detail?: string;
+  info?: boolean;
 }
 interface SelfTestResultLike {
   ranAt: string;
   allPassed: boolean;
   probes?: SelfTestCheckLike[];
   checks: SelfTestCheckLike[];
+  steps?: string[];
+  mismatches?: string[];
+  failedStep?: string | null;
 }
 
 async function onSelfTestClick(e: Event): Promise<void> {
@@ -354,23 +387,37 @@ async function onSelfTestClick(e: Event): Promise<void> {
 function renderSelfTestResult(result: SelfTestResultLike): void {
   el.selftestResult.hidden = false;
 
+  const mark = (c: SelfTestCheckLike): { cls: string; sign: string } => {
+    if (!c.pass) return { cls: 'selftest-fail', sign: '✗' };
+    return c.info ? { cls: 'selftest-info', sign: 'ℹ' } : { cls: 'selftest-pass', sign: '✓' };
+  };
   const list = (checks: SelfTestCheckLike[]): string =>
     `<ul>${checks
-      .map(
-        (c) =>
-          `<li class="${c.pass ? 'selftest-pass' : 'selftest-fail'}">${c.pass ? '✓' : '✗'} ${escapeHtml(c.label)}${
-            c.detail ? ` — <span class="muted">${escapeHtml(c.detail)}</span>` : ''
-          }</li>`
-      )
+      .map((c) => {
+        const m = mark(c);
+        return `<li class="${m.cls}">${m.sign} ${escapeHtml(c.label)}${
+          c.detail ? ` — <span class="muted">${escapeHtml(c.detail)}</span>` : ''
+        }</li>`;
+      })
       .join('')}</ul>`;
 
   const probesHtml = result.probes?.length ? `<strong>Capability probes</strong>${list(result.probes)}` : '';
   const checksHtml = `<strong>Fixture</strong>${list(result.checks)}`;
+  const failedHtml = result.failedStep
+    ? `<p class="selftest-fail">First failing step: ${escapeHtml(result.failedStep)}</p>`
+    : '';
+  const stepsHtml = result.steps?.length
+    ? `<details class="selftest-steps"><summary>Step log (${result.steps.length})</summary><pre>${escapeHtml(
+        result.steps.join('\n')
+      )}</pre></details>`
+    : '';
 
   el.selftestResult.innerHTML =
     `<strong>${result.allPassed ? 'All checks passed' : 'Some checks failed'}</strong>` +
+    failedHtml +
     probesHtml +
     checksHtml +
+    stepsHtml +
     `<button id="selftest-copy-btn" class="btn btn-secondary btn-small" type="button">Copy results</button>` +
     `<span id="selftest-copy-feedback" class="copy-feedback" hidden>Copied.</span>`;
 
