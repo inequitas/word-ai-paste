@@ -332,7 +332,10 @@ async function insertText(
 
         const headerRowCount = block.header ? options.tableStyle.headerRowCount : 0;
         log(index, 'table', 'applyStyle');
-        await table.applyStyle({ ...options.tableStyle, headerRowCount });
+        const styleNotes = await table.applyStyle({ ...options.tableStyle, headerRowCount });
+        for (const note of styleNotes) {
+          log(index, 'table', `note: ${note}`);
+        }
         // The next block (if any) is created directly after the table, with
         // its own text — no empty paragraph first (normalize.ts already adds
         // the house-style blank line after a table).

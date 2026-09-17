@@ -294,8 +294,9 @@ class FakeTableHandle implements WordTableHandle {
     readonly table: FakeTable
   ) {}
 
-  async applyStyle(settings: TableStyleSettings): Promise<void> {
+  async applyStyle(settings: TableStyleSettings): Promise<string[]> {
     this.table.style = settings;
+    return [];
   }
 
   insertParagraphAfter(text: string): WordParagraphHandle {

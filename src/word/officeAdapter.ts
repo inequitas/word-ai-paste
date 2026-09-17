@@ -15,6 +15,7 @@ import type {
 } from './adapter';
 import type { Block } from '../model';
 import { describeError, insertBlocks, type InsertOptions, type InsertReport } from './insert';
+import { formatLook, lookMismatches, parseTblLook, type TableLook } from './tableLook';
 
 /** True once, cheap: is the Word host new enough for everything this add-in needs? */
 export function isWordApi13Supported(): boolean {
@@ -132,7 +133,9 @@ class OfficeTableHandle implements WordTableHandle {
     private readonly context: Word.RequestContext
   ) {}
 
-  async applyStyle(settings: TableStyleSettings): Promise<void> {
+  async applyStyle(settings: TableStyleSettings): Promise<string[]> {
+    const notes: string[] = [];
+
     // The table must exist server-side before it can be styled.
     await this.context.sync();
 
@@ -163,6 +166,143 @@ class OfficeTableHandle implements WordTableHandle {
       await this.context.sync();
     } catch (err) {
       console.warn('AI Paste: table style flags (header row / banding) failed to apply.', err);
+      notes.push(`table look: could not set flags (${String(err).substring(0, 50)})`);
+      return notes;
+    }
+
+    // Verify and correct the table look by reading back the OOXML and comparing
+    // with what we intended to set.
+    await this.verifyAndCorrectTableLook(settings, notes);
+
+    return notes;
+  }
+
+  private async verifyAndCorrectTableLook(settings: TableStyleSettings, notes: string[]): Promise<void> {
+    // Build the target: what we intended to set
+    const target: TableLook = {
+      firstRow: true,
+      lastRow: settings.styleTotalRow,
+      firstColumn: settings.styleFirstColumn,
+      lastColumn: settings.styleLastColumn,
+      noHBand: !settings.styleBandedRows,
+      noVBand: !settings.styleBandedColumns
+    };
+
+    // Read the actual look from the OOXML
+    let actual = await this.readActualTableLook();
+    if (!actual) {
+      notes.push('table look: could not read tblLook');
+      return;
+    }
+
+    notes.push(`table look (as set): ${formatLook(actual)}`);
+
+    // Check for mismatches
+    const mismatches = lookMismatches(actual, target);
+    if (!mismatches.length) {
+      return; // Perfect match
+    }
+
+    notes.push(`table look: mismatches in [${mismatches.join(', ')}]`);
+
+    // Try to correct mismatches in firstColumn and lastColumn
+    if (mismatches.includes('firstColumn') || mismatches.includes('lastColumn')) {
+      await this.trySwapColumns(target, notes);
+      // Re-read after correction attempt
+      actual = await this.readActualTableLook();
+      if (actual) {
+        notes.push(`table look (after column swap): ${formatLook(actual)}`);
+        // Update target and check again
+        const newMismatches = lookMismatches(actual, target);
+        if (!newMismatches.length) {
+          return; // Correction successful
+        }
+      }
+    }
+
+    // Try to correct mismatches in noHBand and noVBand
+    if (mismatches.includes('noHBand') || mismatches.includes('noVBand')) {
+      await this.trySwapBands(target, notes);
+      // Re-read after correction attempt
+      actual = await this.readActualTableLook();
+      if (actual) {
+        notes.push(`table look (after band swap): ${formatLook(actual)}`);
+      }
+    }
+  }
+
+  private async readActualTableLook(): Promise<TableLook | null> {
+    try {
+      const range = this.table.getRange();
+      const ooxml = range.getOoxml();
+      await this.context.sync();
+      return parseTblLook(ooxml.value);
+    } catch (err) {
+      console.warn('AI Paste: could not read table OOXML to verify table look.', err);
+      return null;
+    }
+  }
+
+  private async trySwapColumns(target: TableLook, notes: string[]): Promise<void> {
+    try {
+      // Swap firstColumn and lastColumn
+      const swapped = this.table.styleLastColumn;
+      this.table.styleLastColumn = this.table.styleFirstColumn;
+      this.table.styleFirstColumn = swapped;
+      await this.context.sync();
+
+      // Read back to check if the swap fixed it
+      const newActual = await this.readActualTableLook();
+      if (newActual) {
+        const target2: TableLook = { ...target };
+        const newMismatches = lookMismatches(newActual, target2);
+        if (!newMismatches.includes('firstColumn') && !newMismatches.includes('lastColumn')) {
+          // Swap was successful
+          notes.push(`table look: first/last column were swapped by Word; corrected by swapping the flags`);
+          return;
+        }
+      }
+
+      // Swap did not fix it; restore original values
+      const restored = this.table.styleLastColumn;
+      this.table.styleLastColumn = this.table.styleFirstColumn;
+      this.table.styleFirstColumn = restored;
+      await this.context.sync();
+      notes.push(`table look: could not correct first/last column`);
+    } catch (err) {
+      console.warn('AI Paste: error trying to swap table column flags.', err);
+      notes.push(`table look: column swap attempt failed`);
+    }
+  }
+
+  private async trySwapBands(target: TableLook, notes: string[]): Promise<void> {
+    try {
+      // Swap styleBandedRows and styleBandedColumns
+      const swapped = this.table.styleBandedColumns;
+      this.table.styleBandedColumns = this.table.styleBandedRows;
+      this.table.styleBandedRows = swapped;
+      await this.context.sync();
+
+      // Read back to check if the swap fixed it
+      const newActual = await this.readActualTableLook();
+      if (newActual) {
+        const newMismatches = lookMismatches(newActual, target);
+        if (!newMismatches.includes('noHBand') && !newMismatches.includes('noVBand')) {
+          // Swap was successful
+          notes.push(`table look: banding was reversed by Word; corrected by swapping the flags`);
+          return;
+        }
+      }
+
+      // Swap did not fix it; restore original values
+      const restored = this.table.styleBandedColumns;
+      this.table.styleBandedColumns = this.table.styleBandedRows;
+      this.table.styleBandedRows = restored;
+      await this.context.sync();
+      notes.push(`table look: could not correct banding`);
+    } catch (err) {
+      console.warn('AI Paste: error trying to swap table band flags.', err);
+      notes.push(`table look: band swap attempt failed`);
     }
   }
 

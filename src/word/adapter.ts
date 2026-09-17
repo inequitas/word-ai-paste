@@ -119,9 +119,10 @@ export interface WordTableHandle {
    * then applies `settings`. Never throws: if `styleBuiltIn` fails, falls
    * back to setting `style` by its English display name; if that also
    * fails, logs a warning and leaves the table with Word's default table
-   * look rather than failing the whole insert.
+   * look rather than failing the whole insert. Returns human-readable notes
+   * about what was applied (e.g. "table look (as set): firstRow=1 lastRow=0 ...").
    */
-  applyStyle(settings: TableStyleSettings): Promise<void>;
+  applyStyle(settings: TableStyleSettings): Promise<string[]>;
   /**
    * Creates and returns a new paragraph (with `text` from creation)
    * directly after the table. insert.ts only calls this when another of

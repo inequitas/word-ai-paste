@@ -418,6 +418,66 @@ async function runCapabilityProbes(context: Word.RequestContext, onProbe: (label
     };
   });
 
+  await probe('table look: GridTable4 + house flags → tblLook firstColumn=1, lastColumn=0?', {}, async (s) => {
+    const holder = await s.plainParagraph('');
+    const table = holder.insertTable(3, 2, Word.InsertLocation.after, [
+      ['Col A', 'Col B'],
+      ['a1', 'b1'],
+      ['a2', 'b2']
+    ]);
+    s.created(table);
+    table.styleBuiltIn = Word.BuiltInStyleName.gridTable4;
+    table.headerRowCount = 1;
+    table.styleFirstColumn = true;
+    table.styleBandedRows = true;
+    table.styleBandedColumns = false;
+    table.styleLastColumn = false;
+    table.styleTotalRow = false;
+    await context.sync();
+
+    // Read back the API values
+    table.load('styleFirstColumn,styleLastColumn,styleBandedRows,styleBandedColumns,styleTotalRow,headerRowCount');
+    await context.sync();
+
+    // Read the OOXML to get the actual tblLook
+    const range = table.getRange();
+    const ooxml = range.getOoxml();
+    await context.sync();
+
+    // Extract tblLook from OOXML using regex
+    const tblLookMatch = /<w:tblLook[^>]*w:val="([0-9A-Fa-f]+)"/.exec(ooxml.value);
+    const hexVal = tblLookMatch ? parseInt(tblLookMatch[1], 16) : 0;
+    const firstColumn = !!(hexVal & 0x0080);
+    const lastColumn = !!(hexVal & 0x0100);
+
+    // Read bold status of cells (0,0), (0,1), (1,0), (1,1)
+    const boldStatus: { [key: string]: boolean | string } = {};
+    for (let r = 0; r < 2; r++) {
+      for (let c = 0; c < 2; c++) {
+        try {
+          const cell = table.getCell(r, c);
+          const range = cell.body.getRange();
+          range.load('font/bold');
+          await context.sync();
+          boldStatus[`bold(${r},${c})`] = range.font.bold;
+        } catch {
+          boldStatus[`bold(${r},${c})`] = 'error';
+        }
+      }
+    }
+
+    const pass = firstColumn === true && lastColumn === false;
+    const detail = [
+      `API: styleFirstColumn=${table.styleFirstColumn}, styleLastColumn=${table.styleLastColumn}, styleBandedRows=${table.styleBandedRows}, styleBandedColumns=${table.styleBandedColumns}`,
+      `tblLook hex=${tblLookMatch ? tblLookMatch[1] : 'not found'} → firstColumn=${firstColumn}, lastColumn=${lastColumn}`,
+      `cell formatting: ${Object.entries(boldStatus)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ')}`
+    ].join('; ');
+
+    return { pass, detail };
+  });
+
   await probe('selection.isEmpty can be loaded (a collapsed cursor is never deleted)', {}, async () => {
     const selection = context.document.getSelection();
     selection.load('isEmpty');
