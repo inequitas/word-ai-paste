@@ -10,6 +10,17 @@ import { OfficeWordDocument, isWordApi13Supported } from './officeAdapter';
  * separate numbered lists (each must restart at 1), a table, and a quote —
  * one markdown string run through the exact same parse -> normalize ->
  * insert pipeline as a real paste.
+ *
+ * "Blank lines between blocks" is deliberately turned OFF for this fixture
+ * (unlike the real default) so that a body paragraph and a heading sit
+ * *directly* after a list with nothing normalize.ts would insert in
+ * between — that adjacency is exactly what real Word can silently turn
+ * into "just another list item" (see insert.ts's "Leaving a list cleanly"
+ * doc comment), and unit tests can't catch that without a real Word
+ * runtime. The blank-line spacing feature itself is already covered by
+ * tests/normalize.test.ts. A genuine empty paragraph is then spliced in
+ * by hand right after the third list, below, since Markdown itself has no
+ * way to express an empty paragraph.
  */
 const FIXTURE_MARKDOWN = `# Self-test heading 1
 
@@ -25,10 +36,12 @@ A paragraph with **bold**, *italic* and a [link](https://example.com) run, plus 
   - Nested bullet
 - Bullet two
 
+Body text right after the bulleted list.
+
 1. First numbered list, item one
 2. First numbered list, item two
 
-Some text between the two numbered lists.
+## A heading right after a numbered list
 
 1. Second numbered list, item one
 2. Second numbered list, item two
@@ -62,7 +75,15 @@ export async function runSelfTest(): Promise<SelfTestResult> {
     };
   }
 
-  const blocks = normalize(parseMarkdown(FIXTURE_MARKDOWN), DEFAULT_NORMALIZE_OPTIONS);
+  let blocks = normalize(parseMarkdown(FIXTURE_MARKDOWN), { ...DEFAULT_NORMALIZE_OPTIONS, blankLinesBetweenBlocks: false });
+  // Splice a genuine empty paragraph in right after the third list (before
+  // the table) — Markdown can't express one, but this is exactly the shape
+  // of the "reused an empty bullet as the insertion point" / "blank line
+  // right after a list" case the list-escape logic has to get right.
+  const tableIndex = blocks.findIndex((b) => b.type === 'table');
+  if (tableIndex !== -1) {
+    blocks = [...blocks.slice(0, tableIndex), { type: 'paragraph', inlines: [] }, ...blocks.slice(tableIndex)];
+  }
   const checks: SelfTestCheck[] = [];
 
   await Word.run(async (context) => {
@@ -128,6 +149,28 @@ export async function runSelfTest(): Promise<SelfTestResult> {
     checks.push({
       label: 'A Quote-styled paragraph was inserted',
       pass: styles.includes('Quote')
+    });
+
+    // The list-escape fix: none of these may come back as ListParagraph.
+    const bodyAfterList = paragraphs.items.find((p) => /body text right after the bulleted list/i.test(p.text));
+    checks.push({
+      label: 'Body text right after a bulleted list is not a list item',
+      pass: !!bodyAfterList && bodyAfterList.styleBuiltIn === 'Normal',
+      detail: bodyAfterList ? `styleBuiltIn: ${bodyAfterList.styleBuiltIn}` : '(paragraph not found)'
+    });
+
+    const headingAfterList = paragraphs.items.find((p) => /heading right after a numbered list/i.test(p.text));
+    checks.push({
+      label: 'A heading right after a list is not a list item',
+      pass: !!headingAfterList && /^Heading\d$/.test(headingAfterList.styleBuiltIn as string),
+      detail: headingAfterList ? `styleBuiltIn: ${headingAfterList.styleBuiltIn}` : '(paragraph not found)'
+    });
+
+    const blankParagraphs = paragraphs.items.filter((p) => p.text.trim() === '');
+    checks.push({
+      label: 'A blank paragraph right after a list is not a list item',
+      pass: blankParagraphs.length > 0 && blankParagraphs.every((p) => p.styleBuiltIn !== 'ListParagraph'),
+      detail: blankParagraphs.length ? `${blankParagraphs.length} blank paragraph(s) found` : '(no blank paragraph found)'
     });
 
     checks.push({

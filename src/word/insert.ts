@@ -1,5 +1,5 @@
 import type { Block, Inline, TableBlock } from '../model';
-import type { WordDocument, WordListHandle, WordParagraphHandle, TableStyleSettings } from './adapter';
+import type { WordDocument, WordListHandle, WordParagraphHandle, TableStyleSettings, ParagraphIntent } from './adapter';
 
 export type BodyStyleOption = { kind: 'builtin' } | { kind: 'custom'; name: string };
 
@@ -60,12 +60,34 @@ const MAX_HEADING_LEVEL = 9;
  * safely run this add-in at all; `taskpane.ts` checks
  * `Office.context.requirements.isSetSupported('WordApi', '1.3')` once at
  * startup and shows a plain "please update Word" message instead of
- * attempting a degraded insert. This has only been exercised against the
- * TypeScript surface and the real Office.js docs — the one thing only a
- * real-Word test can settle is whether a level's bullet/number counter
- * set via `setLevelBullet`/`setLevelNumbering` truly behaves independently
- * per nesting level the way Word's own bullet button does, for deeply
- * nested lists.
+ * attempting a degraded insert. The one thing only a real-Word test can
+ * settle is whether a level's bullet/number counter set via
+ * `setLevelBullet`/`setLevelNumbering` truly behaves independently per
+ * nesting level the way Word's own bullet button does, for deeply nested
+ * lists.
+ *
+ * Leaving a list cleanly
+ * -----------------------
+ * In real Word, `paragraph.insertParagraphAfter()` on a paragraph that is
+ * currently a list item usually creates *another list item* — the same
+ * thing that happens when you press Enter at the end of a list line — and
+ * setting `styleBuiltIn` afterwards does not reliably remove that list
+ * membership (the style and the list/numPr are separate paragraph
+ * properties). Since almost every list in Kevin's documents is followed by
+ * body text, a blank paragraph, or a heading, this module tracks whichever
+ * `Word.List` the "current position" belongs to (`currentList`) and, for
+ * every block that is *not* a list item, gets its paragraph via
+ * `list.insertParagraphAfter()` instead — which inserts after the whole
+ * list rather than as one more member of it — then forgets `currentList`.
+ * Tables are the one exception: they aren't paragraphs, so inserting one
+ * directly after a list-item paragraph doesn't carry any numPr along with
+ * it.
+ *
+ * As a safety net on top of that (for anything this reasoning gets wrong,
+ * and for the "reused an already-empty bullet as the cursor" case), every
+ * non-list paragraph we create is tracked and re-checked with
+ * `WordDocument.verifyAndRepairListItems` after the main sync — see that
+ * method's doc comment.
  */
 
 export async function insertBlocks(
@@ -75,23 +97,45 @@ export async function insertBlocks(
 ): Promise<void> {
   if (!blocks.length) return;
 
-  const { paragraph: anchor, isEmpty } = await doc.getCursor();
+  const { paragraph: anchor, isEmpty, list: initialList } = await doc.getCursor();
   let cursor = anchor;
   let anchorReusable = isEmpty;
+  let currentList: WordListHandle | null = initialList;
   const listHandles = new Map<number, WordListHandle>();
+  const tracked: ParagraphIntent[] = [];
+
+  /** A fresh paragraph that is guaranteed not to be a member of any list. */
+  const paragraphOutsideList = (): WordParagraphHandle => {
+    const p = currentList ? currentList.insertParagraphAfter() : cursor.insertParagraphAfter();
+    currentList = null;
+    return p;
+  };
 
   const nextParagraph = (): WordParagraphHandle => {
     if (anchorReusable) {
       anchorReusable = false;
+      if (currentList) {
+        // The reused cursor paragraph was itself an (empty) list item.
+        cursor.detachFromList();
+        currentList = null;
+      }
       return cursor;
     }
-    return cursor.insertParagraphAfter();
+    return paragraphOutsideList();
+  };
+
+  const trackNonList = (p: WordParagraphHandle, reapplyStyle: () => void): void => {
+    reapplyStyle();
+    tracked.push({ handle: p, intendedListItem: false, reapplyStyle });
   };
 
   blocks.forEach((block, index) => {
     if (block.type === 'table') {
+      // Not a paragraph, so it never inherits list numbering — safe to
+      // insert straight after the current cursor paragraph either way.
       const tableAnchor = cursor;
       anchorReusable = false;
+      currentList = null;
       const table = tableAnchor.insertTableAfter(tableValues(block));
       const headerRowCount = block.header ? options.tableStyle.headerRowCount : 0;
       table.applyStyle({ ...options.tableStyle, headerRowCount });
@@ -104,17 +148,19 @@ export async function insertBlocks(
       let list = listHandles.get(block.listIndex);
       let p: WordParagraphHandle;
       if (!list) {
-        p = nextParagraph();
+        p = nextParagraph(); // guaranteed not already a list item, as startNewList() requires
         list = p.startNewList();
         listHandles.set(block.listIndex, list);
       } else {
         p = list.insertItemAfter();
       }
+      currentList = list;
       p.setStyleBuiltIn('ListParagraph');
       if (block.level > 0) p.setListLevel(block.level);
       if (block.ordered) list.ensureNumberLevel(block.level, block.start);
       else list.ensureBulletLevel(block.level);
       insertInlines(p, block.inlines);
+      tracked.push({ handle: p, intendedListItem: true });
       cursor = p;
       return;
     }
@@ -125,7 +171,7 @@ export async function insertBlocks(
       // other paragraph.
       for (const line of block.text.split('\n')) {
         const linePara = nextParagraph();
-        applyBodyStyle(linePara, options);
+        trackNonList(linePara, () => applyBodyStyle(linePara, options));
         linePara.insertRun(line, { bold: false, italic: false, fontName: MONOSPACE_FONT });
         cursor = linePara;
       }
@@ -135,16 +181,16 @@ export async function insertBlocks(
     const p = nextParagraph();
     switch (block.type) {
       case 'heading':
-        p.setStyleBuiltIn(headingStyleName(block.level));
+        trackNonList(p, () => p.setStyleBuiltIn(headingStyleName(block.level)));
         insertInlines(p, block.inlines);
         break;
       case 'quote':
-        p.setStyleBuiltIn('Quote');
+        trackNonList(p, () => p.setStyleBuiltIn('Quote'));
         insertInlines(p, block.inlines);
         break;
       case 'paragraph':
       default:
-        applyBodyStyle(p, options);
+        trackNonList(p, () => applyBodyStyle(p, options));
         insertInlines(p, block.inlines);
         break;
     }
@@ -152,6 +198,7 @@ export async function insertBlocks(
   });
 
   await doc.commit();
+  await doc.verifyAndRepairListItems(tracked);
 }
 
 function applyBodyStyle(p: WordParagraphHandle, options: InsertOptions): void {

@@ -1,5 +1,6 @@
 import type {
   CursorInfo,
+  ParagraphIntent,
   RunFormat,
   TableStyleSettings,
   WordDocument,
@@ -11,6 +12,15 @@ import type {
 /**
  * A tiny in-memory recording implementation of the Word adapter interfaces,
  * used to unit-test src/word/insert.ts without a real Word runtime.
+ *
+ * It deliberately reproduces one real-Word quirk: calling
+ * `insertParagraphAfter()` on a paragraph that is currently a list item
+ * creates *another list item* of the same list/level, the same way
+ * pressing Enter at the end of a list line does in real Word. That's the
+ * exact behavior src/word/insert.ts has to route around (via
+ * `WordListHandle.insertParagraphAfter()` instead) and its
+ * verify-and-repair pass has to catch as a safety net — without this, the
+ * fake would be too well-behaved to catch a regression.
  */
 
 export interface FakeRun {
@@ -95,6 +105,14 @@ class FakeParagraphHandle implements WordParagraphHandle {
 
   insertParagraphAfter(): WordParagraphHandle {
     const p = emptyParagraph();
+    // Mirrors real Word: a paragraph inserted right after a list item
+    // becomes another item of that same list/level unless something
+    // explicitly detaches it.
+    if (this.para.listRef) {
+      const { list, level } = this.para.listRef;
+      p.listRef = { list, level };
+      list.members.push(p);
+    }
     insertAfter(this.model, this.para, p);
     return new FakeParagraphHandle(this.model, p);
   }
@@ -115,6 +133,14 @@ class FakeParagraphHandle implements WordParagraphHandle {
   setListLevel(level: number): void {
     if (this.para.listRef) this.para.listRef.level = level;
   }
+
+  detachFromList(): void {
+    if (!this.para.listRef) return;
+    const { list } = this.para.listRef;
+    const idx = list.members.indexOf(this.para);
+    if (idx !== -1) list.members.splice(idx, 1);
+    this.para.listRef = undefined;
+  }
 }
 
 class FakeList implements WordListHandle {
@@ -130,6 +156,15 @@ class FakeList implements WordListHandle {
     p.listRef = { list: this, level: 0 };
     insertAfter(this.model, last, p);
     this.members.push(p);
+    return new FakeParagraphHandle(this.model, p);
+  }
+
+  insertParagraphAfter(): WordParagraphHandle {
+    // Inserted after the whole list (after its last member), and — unlike
+    // insertItemAfter — never a member of it.
+    const last = this.members[this.members.length - 1];
+    const p = emptyParagraph();
+    insertAfter(this.model, last, p);
     return new FakeParagraphHandle(this.model, p);
   }
 
@@ -160,22 +195,50 @@ class FakeTableHandle implements WordTableHandle {
 export class FakeWordDocument implements WordDocument {
   readonly model = new FakeDocumentModel();
   private readonly anchor: FakeParagraph;
+  private readonly anchorList: FakeList | null = null;
   commitCount = 0;
+  /** Diagnostics for tests: how many paragraphs the repair pass detached + restyled, and any warnings it logged. */
+  repairedCount = 0;
+  warnings: string[] = [];
 
-  constructor(options: { anchorText?: string } = {}) {
+  constructor(options: { anchorText?: string; anchorInList?: boolean } = {}) {
     this.anchor = emptyParagraph();
     if (options.anchorText) {
       this.anchor.lines[0].push({ text: options.anchorText, bold: false, italic: false });
+    }
+    if (options.anchorInList) {
+      const list = new FakeList(this.model);
+      this.anchor.listRef = { list, level: 0 };
+      list.members.push(this.anchor);
+      this.anchorList = list;
     }
     this.model.blocks.push(this.anchor);
   }
 
   async getCursor(): Promise<CursorInfo> {
     const isEmpty = this.anchor.lines.length === 1 && this.anchor.lines[0].length === 0;
-    return { paragraph: new FakeParagraphHandle(this.model, this.anchor), isEmpty };
+    return {
+      paragraph: new FakeParagraphHandle(this.model, this.anchor),
+      isEmpty,
+      list: this.anchorList
+    };
   }
 
   async commit(): Promise<void> {
     this.commitCount++;
+  }
+
+  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<void> {
+    for (const r of records) {
+      const para = (r.handle as FakeParagraphHandle).para;
+      const isListItem = Boolean(para.listRef);
+      if (!r.intendedListItem && isListItem) {
+        r.handle.detachFromList();
+        r.reapplyStyle?.();
+        this.repairedCount++;
+      } else if (r.intendedListItem && !isListItem) {
+        this.warnings.push(`expected list item, found none: ${paragraphText(para)}`);
+      }
+    }
   }
 }

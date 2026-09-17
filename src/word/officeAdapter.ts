@@ -1,6 +1,7 @@
 /// <reference types="office-js" />
 import type {
   CursorInfo,
+  ParagraphIntent,
   RunFormat,
   TableStyleSettings,
   WordDocument,
@@ -21,7 +22,9 @@ function isWordApi15Supported(): boolean {
 }
 
 class OfficeParagraphHandle implements WordParagraphHandle {
-  constructor(private readonly paragraph: Word.Paragraph) {}
+  // Not private: OfficeWordDocument.verifyAndRepairListItems needs the raw
+  // Word.Paragraph proxy back to load()/read isListItem on it.
+  constructor(readonly paragraph: Word.Paragraph) {}
 
   setStyleBuiltIn(name: string): void {
     this.paragraph.styleBuiltIn = name as Word.BuiltInStyleName;
@@ -65,6 +68,10 @@ class OfficeParagraphHandle implements WordParagraphHandle {
   setListLevel(level: number): void {
     this.paragraph.listItemOrNullObject.level = level;
   }
+
+  detachFromList(): void {
+    this.paragraph.detachFromList();
+  }
 }
 
 class OfficeListHandle implements WordListHandle {
@@ -74,6 +81,14 @@ class OfficeListHandle implements WordListHandle {
 
   insertItemAfter(): WordParagraphHandle {
     return new OfficeParagraphHandle(this.list.insertParagraph('', Word.InsertLocation.end));
+  }
+
+  insertParagraphAfter(): WordParagraphHandle {
+    // "After" on a List (like on a Table) inserts relative to the whole
+    // list's boundary, not as a new member — unlike "Start"/"End", which
+    // insert inside it. This is what lets a plain body paragraph follow a
+    // list without becoming another bullet/number itself.
+    return new OfficeParagraphHandle(this.list.insertParagraph('', Word.InsertLocation.after));
   }
 
   ensureBulletLevel(level: number): void {
@@ -117,24 +132,57 @@ export class OfficeWordDocument implements WordDocument {
   constructor(private readonly context: Word.RequestContext) {}
 
   async getCursor(): Promise<CursorInfo> {
-    const selection = this.context.document.getSelection();
-    let paragraph = selection.paragraphs.getFirstOrNullObject();
-    paragraph.load('text');
+    // Replacing a selection with "" is a no-op when the selection is
+    // already collapsed (the ordinary paste-at-cursor case), and clears it
+    // otherwise — the brief calls for replacing a non-empty selection
+    // rather than inserting after it, and this does that without needing
+    // a separate load+sync just to check whether there was one.
+    this.context.document.getSelection().insertText('', Word.InsertLocation.replace);
+
+    let paragraph = this.context.document.getSelection().paragraphs.getFirstOrNullObject();
+    paragraph.load('text,listOrNullObject/isNullObject');
     await this.context.sync();
 
     if (paragraph.isNullObject) {
       const fallback = this.context.document.body.paragraphs.getLastOrNullObject();
-      fallback.load('text');
+      fallback.load('text,listOrNullObject/isNullObject');
       await this.context.sync();
       paragraph = fallback;
     }
 
     const isEmpty = !paragraph.isNullObject && paragraph.text.trim().length === 0;
-    return { paragraph: new OfficeParagraphHandle(paragraph), isEmpty };
+    const list =
+      !paragraph.isNullObject && !paragraph.listOrNullObject.isNullObject
+        ? new OfficeListHandle(paragraph.listOrNullObject)
+        : null;
+    return { paragraph: new OfficeParagraphHandle(paragraph), isEmpty, list };
   }
 
   async commit(): Promise<void> {
     await this.context.sync();
+  }
+
+  async verifyAndRepairListItems(records: ParagraphIntent[]): Promise<void> {
+    if (!records.length) return;
+
+    const withRaw = records.map((r) => ({ ...r, raw: (r.handle as OfficeParagraphHandle).paragraph }));
+    withRaw.forEach((r) => r.raw.load('isListItem,text'));
+    await this.context.sync();
+
+    const toRepair = withRaw.filter((r) => !r.intendedListItem && r.raw.isListItem);
+    for (const r of toRepair) {
+      r.handle.detachFromList();
+      r.reapplyStyle?.();
+    }
+    if (toRepair.length) {
+      await this.context.sync();
+    }
+
+    for (const r of withRaw) {
+      if (r.intendedListItem && !r.raw.isListItem) {
+        console.warn('AI Paste: expected paragraph to be a list item after insert, but it is not:', r.raw.text);
+      }
+    }
   }
 }
 

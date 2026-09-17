@@ -230,3 +230,151 @@ describe('insertBlocks', () => {
     expect(doc.commitCount).toBe(0);
   });
 });
+
+describe('insertBlocks — leaving a list cleanly', () => {
+  // The fake adapter reproduces Word's real quirk (insertParagraphAfter on
+  // a list item continues the list), so these tests fail against a naive
+  // implementation and pass only because insert.ts routes non-list content
+  // after a list through WordListHandle.insertParagraphAfter() instead.
+
+  it('a body paragraph right after a bulleted list is not a list item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'item' }] },
+      { type: 'paragraph', inlines: [{ text: 'After the list' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras).toHaveLength(2);
+    expect(paras[1].listRef).toBeUndefined();
+    expect(paras[1].styleBuiltIn).toBe('Normal');
+    expect(paragraphText(paras[1])).toBe('After the list');
+    expect(doc.repairedCount).toBe(0); // the primary fix should handle this, not the safety net
+  });
+
+  it('a heading right after a list is not a list item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: true, level: 0, listIndex: 1, inlines: [{ text: 'item' }] },
+      { type: 'heading', level: 2, inlines: [{ text: 'Next section' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras[1].listRef).toBeUndefined();
+    expect(paras[1].styleBuiltIn).toBe('Heading2');
+  });
+
+  it('a blank spacer paragraph right after a list is not a list item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'item' }] },
+      { type: 'paragraph', inlines: [] },
+      { type: 'paragraph', inlines: [{ text: 'Body' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras).toHaveLength(3);
+    expect(paras[1].listRef).toBeUndefined();
+    expect(paragraphText(paras[1])).toBe('');
+    expect(paras[1].styleBuiltIn).toBe('Normal');
+  });
+
+  it('nested list items still end up outside the list once a non-list block follows', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'top' }] },
+      { type: 'listItem', ordered: false, level: 1, listIndex: 1, inlines: [{ text: 'nested' }] },
+      { type: 'paragraph', inlines: [{ text: 'After' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras[2].listRef).toBeUndefined();
+    expect(paragraphText(paras[2])).toBe('After');
+  });
+
+  it('two adjacent separate lists with nothing between them both stay correctly list-owned', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: true, level: 0, listIndex: 1, inlines: [{ text: 'a1' }] },
+      { type: 'listItem', ordered: true, level: 0, listIndex: 2, inlines: [{ text: 'b1' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    expect(paras[0].listRef?.list).not.toBe(paras[1].listRef?.list);
+    expect(paras[1].listRef?.list.numberLevels.get(0)).toBe(1);
+  });
+
+  it('detaches and restyles a reused cursor paragraph that was itself an empty list item', async () => {
+    const doc = new FakeWordDocument({ anchorText: '', anchorInList: true });
+    const blocks: Block[] = [{ type: 'paragraph', inlines: [{ text: 'Not a bullet' }] }];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const [p] = doc.model.blocks.filter(isParagraph);
+    expect(p.listRef).toBeUndefined();
+    expect(p.styleBuiltIn).toBe('Normal');
+    expect(paragraphText(p)).toBe('Not a bullet');
+  });
+
+  it('starting a fresh list on a reused cursor paragraph that was already a (different) list item restarts at 1', async () => {
+    const doc = new FakeWordDocument({ anchorText: '', anchorInList: true });
+    const blocks: Block[] = [{ type: 'listItem', ordered: true, level: 0, listIndex: 1, inlines: [{ text: 'fresh item' }] }];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const [p] = doc.model.blocks.filter(isParagraph);
+    expect(p.listRef?.level).toBe(0);
+    expect(p.listRef?.list.numberLevels.get(0)).toBe(1);
+  });
+
+  it('a table right after a list resets list tracking for whatever follows it', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const blocks: Block[] = [
+      { type: 'listItem', ordered: false, level: 0, listIndex: 1, inlines: [{ text: 'item' }] },
+      { type: 'table', header: null, rows: [[[{ text: '1' }]]] },
+      { type: 'paragraph', inlines: [{ text: 'After table' }] }
+    ];
+    await insertBlocks(doc, blocks, DEFAULT_INSERT_OPTIONS);
+    const paras = doc.model.blocks.filter(isParagraph);
+    const last = paras[paras.length - 1];
+    expect(last.listRef).toBeUndefined();
+    expect(paragraphText(last)).toBe('After table');
+  });
+});
+
+describe('WordDocument.verifyAndRepairListItems (fake adapter safety net)', () => {
+  it('detaches and restyles a paragraph that ended up a list item when it should not have', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const { paragraph } = await doc.getCursor();
+    const list = paragraph.startNewList();
+    list.ensureBulletLevel(0);
+    let styled = false;
+    await doc.verifyAndRepairListItems([
+      {
+        handle: paragraph,
+        intendedListItem: false,
+        reapplyStyle: () => {
+          paragraph.setStyleBuiltIn('Normal');
+          styled = true;
+        }
+      }
+    ]);
+    expect(doc.repairedCount).toBe(1);
+    expect(styled).toBe(true);
+    const [p] = doc.model.blocks.filter(isParagraph);
+    expect(p.listRef).toBeUndefined();
+    expect(p.styleBuiltIn).toBe('Normal');
+  });
+
+  it('logs a warning (without touching anything) when an intended list item is not one', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const { paragraph } = await doc.getCursor();
+    await doc.verifyAndRepairListItems([{ handle: paragraph, intendedListItem: true }]);
+    expect(doc.repairedCount).toBe(0);
+    expect(doc.warnings).toHaveLength(1);
+  });
+
+  it('does nothing for correctly-matched records', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const { paragraph } = await doc.getCursor();
+    await doc.verifyAndRepairListItems([{ handle: paragraph, intendedListItem: false }]);
+    expect(doc.repairedCount).toBe(0);
+    expect(doc.warnings).toHaveLength(0);
+  });
+});
