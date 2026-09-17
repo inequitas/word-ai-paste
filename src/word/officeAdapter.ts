@@ -245,10 +245,11 @@ class OfficeTableHandle implements WordTableHandle {
 
   private async trySwapColumns(target: TableLook, notes: string[]): Promise<void> {
     try {
-      // Swap firstColumn and lastColumn
-      const swapped = this.table.styleLastColumn;
-      this.table.styleLastColumn = this.table.styleFirstColumn;
-      this.table.styleFirstColumn = swapped;
+      // Swap firstColumn and lastColumn. Use the intended values from
+      // `target`: the proxy's own properties aren't loaded, so reading them
+      // would throw PropertyNotLoaded.
+      this.table.styleFirstColumn = target.lastColumn;
+      this.table.styleLastColumn = target.firstColumn;
       await this.context.sync();
 
       // Read back to check if the swap fixed it
@@ -264,23 +265,22 @@ class OfficeTableHandle implements WordTableHandle {
       }
 
       // Swap did not fix it; restore original values
-      const restored = this.table.styleLastColumn;
-      this.table.styleLastColumn = this.table.styleFirstColumn;
-      this.table.styleFirstColumn = restored;
+      this.table.styleFirstColumn = target.firstColumn;
+      this.table.styleLastColumn = target.lastColumn;
       await this.context.sync();
-      notes.push(`table look: could not correct first/last column`);
+      notes.push(`table look: could not correct first/last column (after swap: ${newActual ? formatLook(newActual) : 'unreadable'})`);
     } catch (err) {
       console.warn('AI Paste: error trying to swap table column flags.', err);
-      notes.push(`table look: column swap attempt failed`);
+      notes.push(`table look: column swap attempt failed (${String(err).substring(0, 80)})`);
     }
   }
 
   private async trySwapBands(target: TableLook, notes: string[]): Promise<void> {
     try {
-      // Swap styleBandedRows and styleBandedColumns
-      const swapped = this.table.styleBandedColumns;
-      this.table.styleBandedColumns = this.table.styleBandedRows;
-      this.table.styleBandedRows = swapped;
+      // Swap styleBandedRows and styleBandedColumns, again from the intended
+      // values (noHBand = !bandedRows, noVBand = !bandedColumns).
+      this.table.styleBandedRows = !target.noVBand;
+      this.table.styleBandedColumns = !target.noHBand;
       await this.context.sync();
 
       // Read back to check if the swap fixed it
@@ -295,14 +295,13 @@ class OfficeTableHandle implements WordTableHandle {
       }
 
       // Swap did not fix it; restore original values
-      const restored = this.table.styleBandedColumns;
-      this.table.styleBandedColumns = this.table.styleBandedRows;
-      this.table.styleBandedRows = restored;
+      this.table.styleBandedRows = !target.noHBand;
+      this.table.styleBandedColumns = !target.noVBand;
       await this.context.sync();
-      notes.push(`table look: could not correct banding`);
+      notes.push(`table look: could not correct banding (after swap: ${newActual ? formatLook(newActual) : 'unreadable'})`);
     } catch (err) {
       console.warn('AI Paste: error trying to swap table band flags.', err);
-      notes.push(`table look: band swap attempt failed`);
+      notes.push(`table look: band swap attempt failed (${String(err).substring(0, 80)})`);
     }
   }
 
