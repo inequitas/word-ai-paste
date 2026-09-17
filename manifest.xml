@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+
+  <Id>1179b9a1-ae94-499b-a75c-d4b019e9a749</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Kevin</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="AI Paste" />
+  <Description DefaultValue="Paste Markdown or formatted chat text into Word using the document's own styles." />
+  <IconUrl DefaultValue="https://inequitas.github.io/word-ai-paste/assets/icon-32.png" />
+  <HighResolutionIconUrl DefaultValue="https://inequitas.github.io/word-ai-paste/assets/icon-80.png" />
+  <SupportUrl DefaultValue="https://github.com/inequitas/word-ai-paste" />
+
+  <AppDomains>
+    <AppDomain>https://inequitas.github.io</AppDomain>
+  </AppDomains>
+
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+
+  <Requirements>
+    <Sets DefaultMinVersion="1.1">
+      <Set Name="WordApi" MinVersion="1.3" />
+    </Sets>
+  </Requirements>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://inequitas.github.io/word-ai-paste/taskpane.html" />
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Requirements>
+      <bt:Sets DefaultMinVersion="1.3">
+        <bt:Set Name="WordApi" />
+      </bt:Sets>
+    </Requirements>
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title" />
+            <Description resid="GetStarted.Description" />
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl" />
+          </GetStarted>
+          <FunctionFile resid="Taskpane.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="AiPaste.Group1">
+                <Label resid="CommandsGroup.Label" />
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16x16" />
+                  <bt:Image size="32" resid="Icon.32x32" />
+                  <bt:Image size="80" resid="Icon.80x80" />
+                </Icon>
+                <Control xsi:type="Button" id="AiPaste.TaskpaneButton">
+                  <Label resid="TaskpaneButton.Label" />
+                  <Supertip>
+                    <Title resid="TaskpaneButton.Label" />
+                    <Description resid="TaskpaneButton.Tooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16x16" />
+                    <bt:Image size="32" resid="Icon.32x32" />
+                    <bt:Image size="80" resid="Icon.80x80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>AiPaste.Taskpane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16x16" DefaultValue="https://inequitas.github.io/word-ai-paste/assets/icon-16.png" />
+        <bt:Image id="Icon.32x32" DefaultValue="https://inequitas.github.io/word-ai-paste/assets/icon-32.png" />
+        <bt:Image id="Icon.80x80" DefaultValue="https://inequitas.github.io/word-ai-paste/assets/icon-80.png" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://github.com/inequitas/word-ai-paste" />
+        <bt:Url id="Taskpane.Url" DefaultValue="https://inequitas.github.io/word-ai-paste/taskpane.html" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="AI Paste is ready" />
+        <bt:String id="CommandsGroup.Label" DefaultValue="AI Paste" />
+        <bt:String id="TaskpaneButton.Label" DefaultValue="AI Paste" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="Click the AI Paste button to open the task pane, then paste your GPT text." />
+        <bt:String id="TaskpaneButton.Tooltip" DefaultValue="Paste Markdown or formatted chat text using this document's own styles." />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>
