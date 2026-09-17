@@ -68,13 +68,13 @@ describe('self-test fixture', () => {
     expect(byLabel(checks, 'a nested list level was created (level 1)').pass).toBe(true);
   });
 
-  it('reports the actual indents when the level indents could not be set', async () => {
+  it('recovers with direct paragraph indents when setLevelIndents could not be set', async () => {
     const doc = new FakeWordDocument({ anchorText: '' });
     doc.failNext('setLevelIndents', 99);
     const report = await insertBlocks(doc, buildFixtureBlocks(), DEFAULT_INSERT_OPTIONS);
     const check = byLabel(buildFixtureChecks(report), "list indent matches Word's bullet button (≈36pt text / 18pt bullet)");
-    expect(check.pass).toBe(false);
-    expect(check.detail).toContain('leftIndent=90, firstLineIndent=-18');
+    // setIndents is called as a fallback, so the indents should still be correct
+    expect(check.pass).toBe(true);
   });
 
   it('names the failing items when a list item did not become one', async () => {

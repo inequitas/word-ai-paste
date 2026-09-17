@@ -49,6 +49,10 @@ export interface FakeParagraph {
   /** One array per line — a hard line break starts a new line array. */
   lines: FakeRun[][];
   listRef?: { list: FakeList; level: number };
+  /** Explicit left indent in points, set by setIndents(). */
+  leftIndent?: number;
+  /** Explicit first-line indent in points, set by setIndents(). */
+  firstLineIndent?: number;
 }
 
 export interface FakeTable {
@@ -192,6 +196,11 @@ export class FakeParagraphHandle implements WordParagraphHandle {
   detachFromList(): void {
     if (this.para.listRef) this.para.listRef.list.leave(this.para);
   }
+
+  setIndents(leftIndentPt: number, firstLineIndentPt: number): void {
+    this.para.leftIndent = leftIndentPt;
+    this.para.firstLineIndent = firstLineIndentPt;
+  }
 }
 
 let nextListId = 1000;
@@ -251,9 +260,11 @@ export class FakeList implements WordListHandle {
     this.bulletLevels.delete(level);
   }
 
-  setLevelIndents(level: number, textIndent: number, bulletIndent: number): void {
+  setLevelIndents(level: number, textIndent: number, bulletIndentRelative: number): void {
     this.doc.fire('setLevelIndents');
-    this.levelIndents.set(level, { textIndent, bulletIndent });
+    // Store the absolute position: relative indent is applied to textIndent
+    const bulletIndentAbsolute = textIndent + bulletIndentRelative;
+    this.levelIndents.set(level, { textIndent, bulletIndent: bulletIndentAbsolute });
   }
 
   setLevelStartingNumber(level: number, startingNumber: number): void {
@@ -417,16 +428,18 @@ export class FakeWordDocument implements WordDocument {
 
 export function readBackOf(p: FakeParagraph): ReadBackParagraph {
   const ref = p.listRef;
-  let leftIndent = p.styleBuiltIn === 'ListParagraph' ? LIST_PARAGRAPH_STYLE_INDENT : 0;
-  let firstLineIndent = 0;
-  if (ref) {
+  // Check for explicit indents set by setIndents() first
+  let leftIndent = p.leftIndent !== undefined ? p.leftIndent : (p.styleBuiltIn === 'ListParagraph' ? LIST_PARAGRAPH_STYLE_INDENT : 0);
+  let firstLineIndent = p.firstLineIndent !== undefined ? p.firstLineIndent : 0;
+  if (ref && p.leftIndent === undefined) {
+    // Without explicit setIndents, derive from list configuration.
     // Without setLevelIndents, model the "much deeper" default indent Kevin saw.
     const indents = ref.list.levelIndents.get(ref.level) ?? { textIndent: 90 + 36 * ref.level, bulletIndent: 72 + 36 * ref.level };
     leftIndent = indents.textIndent;
     firstLineIndent = indents.bulletIndent - indents.textIndent;
   }
   return {
-    text: paragraphText(p).replace(/\n/g, ''),
+    text: paragraphText(p).replace(/\n/g, ''),
     isListItem: Boolean(ref),
     styleBuiltIn: p.styleBuiltIn ?? (p.styleName ? 'Other' : 'Normal'),
     leftIndent,

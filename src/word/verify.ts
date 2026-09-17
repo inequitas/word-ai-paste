@@ -136,6 +136,15 @@ export function listLevelIndents(level: number): { textIndent: number; bulletInd
   return { textIndent: 36 + 36 * level, bulletIndent: 18 + 36 * level };
 }
 
+/**
+ * Arguments for `list.setLevelIndents(level, textIndent, bulletIndentRelative)`.
+ * Word treats the third argument as relative to the text indent (it becomes
+ * the paragraph's `firstLineIndent`), as verified in Word for Mac 16.113.
+ */
+export function listLevelIndentArgs(level: number): { textIndent: number; bulletIndentRelative: number } {
+  return { textIndent: 36 + 36 * level, bulletIndentRelative: -18 };
+}
+
 const INDENT_TOLERANCE_PT = 1.5;
 
 /**

@@ -10,7 +10,7 @@ import type {
 } from './adapter';
 import {
   compareReadBack,
-  listLevelIndents,
+  listLevelIndentArgs,
   type ExpectedParagraph,
   type ListRunReport
 } from './verify';
@@ -509,6 +509,11 @@ async function convertListRun(doc: WordDocument, run: PendingRun, log: Log): Pro
       const start = firstAtLevel.block.start;
       await configureLevel(doc, list, level, ordered, start !== undefined && start !== 1 ? start : null, (a) => note(a));
     }
+
+    // Set direct paragraph indents on each item to ensure consistent formatting
+    for (const item of attached) {
+      await setItemIndentsSafely(doc, item.handle, item.block.level, (a) => note(a, item.blockIndex));
+    }
   }
 
   if (fallbackFrom !== null) {
@@ -524,6 +529,7 @@ async function convertListRun(doc: WordDocument, run: PendingRun, log: Log): Pro
         await doc.commit();
         if (block.level > 0) await setLevelSafely(doc, handle, block.level, itemNote);
         await configureLevel(doc, own, block.level, block.ordered, block.ordered ? ordinals[i] : null, itemNote);
+        await setItemIndentsSafely(doc, handle, block.level, itemNote);
       } catch (err) {
         itemNote(`startNewList failed (${describeError(err)})`);
       }
@@ -541,6 +547,19 @@ async function setLevelSafely(doc: WordDocument, p: WordParagraphHandle, level: 
     await doc.commit();
   } catch (err) {
     note(`listItem.level = ${level} failed (${describeError(err)})`);
+  }
+}
+
+async function setItemIndentsSafely(doc: WordDocument, p: WordParagraphHandle, level: number, note: (a: string) => void): Promise<void> {
+  try {
+    const leftIndent = 36 + 36 * level;
+    const firstLineIndent = -18;
+    note(`setIndents(${leftIndent}, ${firstLineIndent})`);
+    p.setIndents(leftIndent, firstLineIndent);
+    await doc.commit();
+  } catch (err) {
+    note(`setIndents failed (${describeError(err)})`);
+    console.warn(`AI Paste: setIndents failed`, err);
   }
 }
 
@@ -567,8 +586,8 @@ async function configureLevel(
   if (ordered) await step(`setLevelNumbering(${level}, arabic)`, () => list.setLevelNumbering(level));
   else await step(`setLevelBullet(${level}, solid)`, () => list.setLevelBullet(level));
 
-  const { textIndent, bulletIndent } = listLevelIndents(level);
-  await step(`setLevelIndents(${level}, ${textIndent}, ${bulletIndent})`, () => list.setLevelIndents(level, textIndent, bulletIndent));
+  const { textIndent, bulletIndentRelative } = listLevelIndentArgs(level);
+  await step(`setLevelIndents(${level}, ${textIndent}, ${bulletIndentRelative})`, () => list.setLevelIndents(level, textIndent, bulletIndentRelative));
 
   if (startingNumber !== null) {
     await step(`setLevelStartingNumber(${level}, ${startingNumber})`, () => list.setLevelStartingNumber(level, startingNumber));

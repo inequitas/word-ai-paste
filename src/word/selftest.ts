@@ -345,9 +345,9 @@ async function runCapabilityProbes(context: Word.RequestContext, onProbe: (label
 
   const bullet0 = listLevelIndents(0);
   for (const bulletArg of [bullet0.bulletIndent, bullet0.bulletIndent - bullet0.textIndent]) {
-    const asUsed = bulletArg === bullet0.bulletIndent;
+    const asUsed = bulletArg === (bullet0.bulletIndent - bullet0.textIndent);
     await probe(
-      `list.setLevelIndents(0, ${bullet0.textIndent}, ${bulletArg})${asUsed ? ' (as used by insert)' : ' (alternative: relative bullet indent)'}`,
+      `list.setLevelIndents(0, ${bullet0.textIndent}, ${bulletArg})${asUsed ? ' (as used by insert)' : ''}`,
       { info: !asUsed },
       async (s) => {
         const p = await s.plainParagraph('Probe: level indents');

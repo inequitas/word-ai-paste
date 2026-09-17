@@ -90,6 +90,11 @@ export class OfficeParagraphHandle implements WordParagraphHandle {
   detachFromList(): void {
     this.paragraph.detachFromList();
   }
+
+  setIndents(leftIndentPt: number, firstLineIndentPt: number): void {
+    this.paragraph.leftIndent = leftIndentPt;
+    this.paragraph.firstLineIndent = firstLineIndentPt;
+  }
 }
 
 class OfficeListHandle implements WordListHandle {

@@ -258,6 +258,24 @@ describe('insertBlocks — two-phase lists', () => {
     expect(rb[1]).toMatchObject({ leftIndent: 72, firstLineIndent: -18 });
   });
 
+  it('sets direct paragraph indents on every list item to ensure consistent formatting', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    const report = await insertBlocks(doc, [bullet('a'), bullet('b', 1, 1), bullet('c')], DEFAULT_INSERT_OPTIONS);
+    const [a, b, c] = doc.paragraphs;
+    // All items should have explicit indents set via setIndents
+    expect(a.leftIndent).toBe(36);
+    expect(a.firstLineIndent).toBe(-18);
+    expect(b.leftIndent).toBe(72);
+    expect(b.firstLineIndent).toBe(-18);
+    expect(c.leftIndent).toBe(36);
+    expect(c.firstLineIndent).toBe(-18);
+    // Verify read-back shows the same values
+    const rb = report.readBack!.paragraphs;
+    expect(rb[0]).toMatchObject({ leftIndent: 36, firstLineIndent: -18 });
+    expect(rb[1]).toMatchObject({ leftIndent: 72, firstLineIndent: -18 });
+    expect(rb[2]).toMatchObject({ leftIndent: 36, firstLineIndent: -18 });
+  });
+
   it('gives two separate listIndex values two independent lists, each numbered from 1', async () => {
     const doc = new FakeWordDocument({ anchorText: '' });
     const blocks: Block[] = [numbered('a1'), numbered('a2'), para('between'), numbered('b1', 2), numbered('b2', 2)];
@@ -298,7 +316,7 @@ describe('insertBlocks — two-phase lists', () => {
     const report = await insertBlocks(doc, [bullet('a'), bullet('b')], DEFAULT_INSERT_OPTIONS);
     const [a, b] = doc.paragraphs;
     expect(b.listRef?.list).toBe(a.listRef?.list);
-    expect(report.steps.map(formatStep).some((s) => s.includes('setLevelIndents(0, 36, 18) failed'))).toBe(true);
+    expect(report.steps.map(formatStep).some((s) => s.includes('setLevelIndents(0, 36, -18) failed'))).toBe(true);
   });
 });
 
@@ -638,6 +656,25 @@ describe('insertBlocks — per-item-lists fallback', () => {
     expect(items.map((p) => p.listRef?.level)).toEqual([0, 1, 1, 0]);
     expect(items.map(listString)).toEqual(['1.', '1.', '2.', '2.']);
     expect(items[1].listRef!.list.levelIndents.get(1)).toEqual({ textIndent: 72, bulletIndent: 54 });
+  });
+
+  it('sets direct paragraph indents on per-item fallback items', async () => {
+    const doc = new FakeWordDocument({ anchorText: '' });
+    doc.failNext('attachToList');
+    const report = await insertBlocks(doc, [bullet('a'), bullet('b', 1, 1), bullet('c')], DEFAULT_INSERT_OPTIONS);
+    const [a, b, c] = doc.paragraphs;
+    // All items in per-item fallback should have explicit indents
+    expect(a.leftIndent).toBe(36);
+    expect(a.firstLineIndent).toBe(-18);
+    expect(b.leftIndent).toBe(72);
+    expect(b.firstLineIndent).toBe(-18);
+    expect(c.leftIndent).toBe(36);
+    expect(c.firstLineIndent).toBe(-18);
+    // Verify read-back shows the same values
+    const rb = report.readBack!.paragraphs;
+    expect(rb[0]).toMatchObject({ leftIndent: 36, firstLineIndent: -18 });
+    expect(rb[1]).toMatchObject({ leftIndent: 72, firstLineIndent: -18 });
+    expect(rb[2]).toMatchObject({ leftIndent: 36, firstLineIndent: -18 });
   });
 
   it('does not throw when even the fallback fails, but reports the missing list item', async () => {

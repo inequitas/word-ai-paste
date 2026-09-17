@@ -76,6 +76,11 @@ export interface WordParagraphHandle {
    * paragraph whose list-item status was confirmed by a prior read.
    */
   detachFromList(): void;
+  /**
+   * Sets the paragraph's left indent and first-line indent (hanging indent).
+   * Used after list configuration to ensure consistent indents on every item.
+   */
+  setIndents(leftIndentPt: number, firstLineIndentPt: number): void;
 }
 
 export interface WordListHandle {
