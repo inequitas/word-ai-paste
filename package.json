@@ -1,0 +1,27 @@
+{
+  "name": "word-ai-paste",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Word add-in that pastes Markdown / GPT-chat HTML into Word using the document's own built-in styles.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "validate-manifest": "office-addin-manifest validate manifest.xml"
+  },
+  "devDependencies": {
+    "@types/office-js": "^1.0.460",
+    "happy-dom": "^15.11.7",
+    "office-addin-manifest": "^1.13.5",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "marked": "^14.1.3"
+  }
+}
